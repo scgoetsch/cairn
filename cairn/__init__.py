@@ -5,7 +5,7 @@ writer; cairn imports bd's export, answers the same read verbs, and diffs its
 answers against bd's.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # The CLI name. bd's verbs and flags are kept, so porting a hook is a matter of
 # swapping this name for `bd` in the hook script.

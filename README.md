@@ -31,7 +31,7 @@ cairn ready [--json] [-n N] [-p P1] [-t bug] [--parent ID] [--include-deferred]
 cairn list  [--status=in_progress] [--all] [--json] [-n N]
 cairn blocked | show ID | stats | where | check
 cairn memories [keyword] | recall KEY
-cairn prime [--budget BYTES]
+cairn prime [--budget BYTES]         # default 10000: what Claude Code shows of a hook in full
 cairn export [--include-memories | --all] [-o FILE]
 cairn import FILE [--interactions F] [--ledger F] [--hot F]   # build from files, no bd
 ```

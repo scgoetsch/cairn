@@ -1,10 +1,12 @@
 """Session priming payload, built to a byte budget.
 
-Hosts truncate what a session-start hook prints (about 39 KB was measured on
-one), and a truncated payload loses its tail silently. So the payload is tiered:
-hot memories in full, every other memory as a key only, and the whole thing held
-under a budget. When hot bodies do not fit, the largest are moved to the index
-and the payload says which — nothing is dropped without a line saying so.
+Hosts truncate what a session-start hook prints — Claude Code shows the first
+10,000 bytes of a hook's output in full and only a 2,000-byte preview beyond
+that (measured 2026-09-22 with synthetic hooks) — and a truncated payload loses
+its tail silently. So the payload is tiered: hot memories in full, every other
+memory as a key only, and the whole thing held under a budget that defaults to
+that 10,000. When hot bodies do not fit, the largest are moved to the index and
+the payload says which — nothing is dropped without a line saying so.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from . import PROG
 from .queries import Snapshot, memories as all_memories
 from .store import get_meta
 
-DEFAULT_BUDGET = 32_000
+DEFAULT_BUDGET = 10_000
 TOP_READY = 5
 
 
