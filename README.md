@@ -6,7 +6,8 @@ database, the verbs and flags of [beads](https://github.com/gastownhall/beads)
 
 **Status: a read-only shadow of a beads store.** bd is the only writer. cairn
 rebuilds its database from `bd export --all`, answers the same read questions,
-and diffs its answers against bd's. Write verbs are refused. Deleting the
+and diffs its answers against bd's. Write verbs are refused, and so is
+`ready --claim`, bd's claim behind a read verb. Deleting the
 `.cairn/` directory undoes everything. The intent is to run in shadow until the
 two have agreed for long enough, then let cairn write alongside bd, and only
 then consider replacing it.
@@ -131,6 +132,20 @@ Measured on a throwaway bd 1.1.2 store and pinned by `tests/test_semantics.py`:
 Not measured (bd refuses to close an issue with an open blocker): whether a
 closed issue can count as blocked. cairn assumes it cannot.
 
+How bd allocates ids, measured the same way and pinned by `IdAllocationTest` in
+`tests/test_bd_integration.py`. cairn allocates none yet; a writer has to be
+designed around these:
+
+- A root id is the prefix, a dash and three characters of `[0-9a-z]` in a small
+  store; it is not a function of the title.
+- Children are numbered `<parent>.1`, `.2`, … to any depth, and a number is
+  never issued twice: deleting a child does not free its number. Deleted ids
+  are absent from the export, so the next number cannot be derived from one.
+- `bd create --id` accepts any id under the store's prefix, but not together
+  with `--parent`: a child-shaped id given alone gets no parent link.
+- `bd create --id` with an id that is taken does not fail. It replaces the
+  issue — exit 0, the description gone, a closed issue open again.
+
 ## Differences from bd that are deliberate
 
 - `export` is sorted by id, and dependency lists inside a row are sorted, so
@@ -184,8 +199,8 @@ CAIRN_TEST_WITH_BD=1 python3 -m unittest tests.test_bd_integration
 ```
 
 builds the measured edge cases on a throwaway store with the real `bd` and
-requires a clean comparison, including `bd show` for every issue. Run it after
-upgrading bd.
+requires a clean comparison, including `bd show` for every issue; a second
+store re-measures id allocation. Run it after upgrading bd.
 
 ## Licence
 

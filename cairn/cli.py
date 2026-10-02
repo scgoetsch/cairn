@@ -38,6 +38,12 @@ class Refused(Exception):
     """A request cairn will not carry out (exit 2)."""
 
 
+def refuse_write(what: str) -> int:
+    print(f"{PROG}: '{what}' refused — cairn is a read-only shadow at this stage; "
+          "bd is the only writer. Use bd for this.", file=sys.stderr)
+    return 2
+
+
 def emit_json(obj: Any) -> None:
     print(json.dumps(obj, indent=2, ensure_ascii=False))
 
@@ -131,6 +137,10 @@ def cmd_stats(args, start: Path) -> int:
 
 
 def cmd_ready(args, start: Path) -> int:
+    if args.claim:
+        # bd's `ready --claim` claims the first ready issue: a write behind a read
+        # verb. Refused before a store is looked for, as the write verbs are.
+        return refuse_write("ready --claim")
     snap = Snapshot(connect(start))
     ids = snap.ready(now=timeutil.now_iso(), include_deferred=args.include_deferred,
                      priority=parse_priority(args.priority), issue_type=args.type,
@@ -461,6 +471,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-a", "--assignee")
     p.add_argument("-u", "--unassigned", action="store_true")
     p.add_argument("--include-deferred", action="store_true")
+    p.add_argument("--claim", action="store_true",
+                   help="refused at this stage: claiming is a write")
     p.set_defaults(func=cmd_ready)
 
     p = sub.add_parser("list", help="list issues (closed hidden unless --all or --status)")
@@ -545,9 +557,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     verb = _first_verb(argv)
     if verb in WRITE_VERBS:
-        print(f"{PROG}: '{verb}' refused — cairn is a read-only shadow at this stage; "
-              "bd is the only writer. Use bd for this.", file=sys.stderr)
-        return 2
+        return refuse_write(verb)
 
     parser = build_parser()
     args = parser.parse_args(argv)

@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from cairn.store import STORE_DIRNAME, find_store_dir
@@ -141,6 +142,23 @@ class RefusalTest(StoreCase):
             self.assertIn("read-only shadow", err)
         _, out, _ = self.cli("list", "--all", "--json")
         self.assertEqual(len(json.loads(out)), 5)
+
+    def test_ready_claim_is_a_write_and_is_refused(self):
+        for argv in (["ready", "--claim"], ["ready", "--claim", "--json"],
+                     ["--json", "ready", "-n", "1", "--claim"]):
+            code, out, err = self.cli(*argv)
+            self.assertEqual((code, out), (2, ""), argv)
+            self.assertIn("'ready --claim' refused", err)
+            self.assertIn("read-only shadow", err)
+        _, out, _ = self.cli("list", "--status=in_progress", "--json")
+        self.assertEqual([i["id"] for i in json.loads(out)], ["t-epic.1"])
+
+    def test_ready_claim_is_refused_where_there_is_no_store(self):
+        with tempfile.TemporaryDirectory() as elsewhere:
+            code, out, err = self.cli("ready", "--claim", cwd=Path(elsewhere))
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("read-only shadow", err)
+        self.assertNotIn("store found", err)
 
     def test_the_value_of_dash_C_is_not_mistaken_for_a_verb(self):
         odd = self.workspace / "create"
