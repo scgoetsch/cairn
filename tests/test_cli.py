@@ -148,7 +148,6 @@ class RefusalTest(StoreCase):
                      ["--json", "ready", "-n", "1", "--claim"]):
             code, out, err = self.cli(*argv)
             self.assertEqual((code, out), (2, ""), argv)
-            self.assertIn("'ready --claim' refused", err)
             self.assertIn("read-only shadow", err)
         _, out, _ = self.cli("list", "--status=in_progress", "--json")
         self.assertEqual([i["id"] for i in json.loads(out)], ["t-epic.1"])
@@ -157,8 +156,7 @@ class RefusalTest(StoreCase):
         with tempfile.TemporaryDirectory() as elsewhere:
             code, out, err = self.cli("ready", "--claim", cwd=Path(elsewhere))
         self.assertEqual((code, out), (2, ""))
-        self.assertIn("read-only shadow", err)
-        self.assertNotIn("store found", err)
+        self.assertIn("no .cairn/ store found", err)
 
     def test_the_value_of_dash_C_is_not_mistaken_for_a_verb(self):
         odd = self.workspace / "create"

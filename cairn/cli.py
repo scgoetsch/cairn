@@ -1,6 +1,7 @@
 """Command line. Verbs and flags follow bd's, so a hook written against bd ports
-by changing the program name. The current stage is read-only: write verbs are
-refused.
+by changing the program name. Write verbs work only on a store made by
+`cairn init`; on a shadow of bd (`cairn shadow sync`) they are refused, because
+bd is that store's only writer.
 
 Exit codes: 0 ok; 1 not found, differences, or `check` errors; 2 refused, bad
 arguments, or could not run. A crash is reported as 2 — never as 1, which a
@@ -14,6 +15,7 @@ import json
 import os
 import signal
 import sqlite3
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -23,14 +25,16 @@ from . import PROG, __version__, prime, shadow, timeutil
 from .importer import SourceError, build_store
 from .queries import LINKED_OMITS, Snapshot, check, memories, recall, stats
 from .store import (GITIGNORE, STORE_DIRNAME, StoreError, db_path, find_store_dir,
-                    load_config, open_db)
+                    init_store, load_config, open_db, open_writable)
+from .writer import WriteConflict, WriteRefused, Writer
 
 GLYPH = {"open": "○", "in_progress": "◐", "blocked": "●", "closed": "✓", "deferred": "❄"}
 LEGEND = "Status: ○ open  ◐ in_progress  ● blocked  ✓ closed  ❄ deferred"
 RULE = "-" * 80
 WRITE_VERBS = ("create", "update", "close", "reopen", "delete", "dep", "remember",
-               "forget", "comment", "note", "defer", "undefer", "claim", "supersede",
-               "duplicate", "init")
+               "forget", "comment", "comments", "note", "defer", "undefer", "init")
+# bd verbs cairn does not implement; refused, never mistaken for something else.
+UNSUPPORTED_VERBS = ("claim", "supersede", "duplicate", "edit")
 PREVIEW = 120
 
 
@@ -39,8 +43,7 @@ class Refused(Exception):
 
 
 def refuse_write(what: str) -> int:
-    print(f"{PROG}: '{what}' refused — cairn is a read-only shadow at this stage; "
-          "bd is the only writer. Use bd for this.", file=sys.stderr)
+    print(f"{PROG}: '{what}' is not supported by cairn.", file=sys.stderr)
     return 2
 
 
@@ -139,8 +142,13 @@ def cmd_stats(args, start: Path) -> int:
 def cmd_ready(args, start: Path) -> int:
     if args.claim:
         # bd's `ready --claim` claims the first ready issue: a write behind a read
-        # verb. Refused before a store is looked for, as the write verbs are.
-        return refuse_write("ready --claim")
+        # verb, under the same compare-and-swap as `update --claim`.
+        writer = open_writer(args, start, claim=True)
+        claimed = writer.claim_ready()
+        if claimed is None:
+            print("No ready issue to claim.")
+            return 1
+        return report_issues(args, writer, [claimed], "Claimed")
     snap = Snapshot(connect(start))
     ids = snap.ready(now=timeutil.now_iso(), include_deferred=args.include_deferred,
                      priority=parse_priority(args.priority), issue_type=args.type,
@@ -438,11 +446,239 @@ def cmd_shadow(args, start: Path) -> int:
     return 1 if differences or losses else 0
 
 
+# -- write verbs ------------------------------------------------------------
+
+def git_config(key: str, start: Path) -> Optional[str]:
+    try:
+        proc = subprocess.run(["git", "config", key], cwd=start, capture_output=True,
+                              text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout.strip() or None
+
+
+def resolve_actor(args, start: Path, *, claim: bool = False) -> str:
+    """--actor, else BEADS_ACTOR, else (not for a claim) git user.name, else $USER.
+    A claim needs a session's own name: bd's fallback to git user.name makes every
+    session the same claimant, and the compare-and-swap then protects nothing."""
+    actor = getattr(args, "actor", None) or os.environ.get("BEADS_ACTOR")
+    if actor:
+        return actor
+    if claim:
+        raise Refused("a claim needs an actor: set BEADS_ACTOR or pass --actor")
+    return git_config("user.name", start) or os.environ.get("USER") or ""
+
+
+def open_writer(args, start: Path, *, claim: bool = False) -> Writer:
+    store = store_dir_or_fail(start)
+    conn = open_writable(db_path(store))
+    _OPEN.append(conn)
+    return Writer(conn, actor=resolve_actor(args, start, claim=claim),
+                  owner=git_config("user.email", start),
+                  issue_prefixes=load_config(store).get("issue_prefixes", []))
+
+
+def report_issues(args, writer: Writer, ids: Sequence[str], verb: str, extra: str = "") -> int:
+    snap = Snapshot(writer.conn)
+    if args.json:
+        emit_json([snap.issue_object(i) for i in ids if i in snap.issues])
+        return 0
+    if getattr(args, "quiet", False):
+        return 0
+    for issue_id in ids:
+        title = snap.issues[issue_id]["title"] if issue_id in snap.issues else ""
+        print(f"✓ {verb} {issue_id} — {title}{extra}")
+    return 0
+
+
+def cmd_init(args, start: Path) -> int:
+    store = start / STORE_DIRNAME
+    if db_path(store).exists():
+        raise Refused(f"{db_path(store)} already exists")
+    ensure_store_dir(store)
+    init_store(db_path(store), args.prefix).close()
+    print(f"Initialised a writable cairn store at {store} (prefix {args.prefix})")
+    return 0
+
+
+def read_text_arg(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise Refused(f"cannot read {path}: {exc.strerror}") from exc
+
+
+def body_arg(args) -> Optional[str]:
+    body = read_text_arg(getattr(args, "body_file", None))
+    if body is not None and args.description is not None:
+        raise Refused("--description and --body-file both given")
+    return body if body is not None else args.description
+
+
+def labels_arg(values: Optional[List[str]]) -> List[str]:
+    return [x.strip() for v in values or [] for x in v.split(",") if x.strip()]
+
+
+def cmd_create(args, start: Path) -> int:
+    title = args.title or args.title_pos
+    if args.title and args.title_pos and args.title != args.title_pos:
+        raise Refused("title given twice")
+    writer = open_writer(args, start)
+    new_id = writer.create(
+        title or "", description=body_arg(args), design=args.design,
+        acceptance=args.acceptance, notes=args.notes,
+        priority=2 if args.priority is None else parse_priority(args.priority),
+        issue_type=args.type or "task", parent=args.parent, issue_id=args.id,
+        labels=labels_arg(args.labels), assignee=args.assignee)
+    if args.defer:
+        writer.defer(new_id, args.defer)
+    if args.silent:
+        print(new_id)
+        return 0
+    if args.json:
+        emit_json(Snapshot(writer.conn).issue_object(new_id))
+        return 0
+    if not args.quiet:
+        print(f"✓ Created issue: {new_id} — {title}")
+    return 0
+
+
+def cmd_update(args, start: Path) -> int:
+    writer = open_writer(args, start, claim=args.claim)
+    for issue_id in args.ids:
+        writer.update(issue_id, claim=args.claim, title=args.title, description=body_arg(args),
+                      design=args.design, acceptance=args.acceptance, notes=args.notes,
+                      append_notes=args.append_notes,
+                      priority=None if args.priority is None else parse_priority(args.priority),
+                      issue_type=args.type, status=args.status, assignee=args.assignee,
+                      add_labels=labels_arg(args.add_label),
+                      remove_labels=labels_arg(args.remove_label))
+        if args.defer:
+            writer.defer(issue_id, args.defer)
+    return report_issues(args, writer, args.ids, "Updated issue:")
+
+
+def cmd_close(args, start: Path) -> int:
+    writer = open_writer(args, start)
+    before = set(Snapshot(writer.conn).ready(now=timeutil.now_iso())) if args.suggest_next else set()
+    for issue_id in args.ids:
+        writer.close(issue_id, args.reason)
+    code = report_issues(args, writer, args.ids, "Closed", f": {args.reason or 'Closed'}")
+    if args.suggest_next and not args.json:
+        snap = Snapshot(writer.conn)
+        newly = [i for i in snap.ready(now=timeutil.now_iso()) if i not in before]
+        for issue_id in newly:
+            print(f"  now ready: {issue_line(snap, issue_id)}")
+    return code
+
+
+def cmd_reopen(args, start: Path) -> int:
+    writer = open_writer(args, start)
+    for issue_id in args.ids:
+        writer.reopen(issue_id)
+    return report_issues(args, writer, args.ids, "Reopened")
+
+
+def cmd_note(args, start: Path) -> int:
+    text = read_text_arg(args.file) if args.file else args.text
+    if not text or (args.file and args.text):
+        raise Refused("note needs exactly one of <text> or --file")
+    writer = open_writer(args, start)
+    writer.note(args.id, text.rstrip("\n"))
+    return report_issues(args, writer, [args.id], "Note added to")
+
+
+def cmd_comment(args, start: Path) -> int:
+    writer = open_writer(args, start)
+    writer.comment(args.id, args.text)
+    return report_issues(args, writer, [args.id], "Comment added to")
+
+
+def cmd_comments(args, start: Path) -> int:
+    """bd's two shapes: `comments <id>` lists, `comments add <id> <text>` writes."""
+    words = args.words
+    if words[0] == "add":
+        if len(words) != 3:
+            raise Refused("usage: comments add <id> <text>")
+        args.id, args.text, args.verb = words[1], words[2], "comment"
+        return cmd_comment(args, start)
+    if len(words) != 1:
+        raise Refused("usage: comments <id>  |  comments add <id> <text>")
+    snap = Snapshot(connect(start))
+    issue_id = words[0]
+    if issue_id not in snap.issues:
+        print(f'Error: no issue found matching "{issue_id}"', file=sys.stderr)
+        return 1
+    rows = snap.comments.get(issue_id, [])
+    if args.json:
+        emit_json([{"id": c["id"], "issue_id": c["issue_id"], "author": c["author"],
+                    "text": c["text"], "created_at": c["created_at"]} for c in rows])
+        return 0
+    if not rows:
+        print(f"No comments on {issue_id}")
+    for c in rows:
+        print(f"[{c['author'] or ''}] {c['created_at']}\n  {c['text']}")
+    return 0
+
+
+def cmd_defer(args, start: Path) -> int:
+    writer = open_writer(args, start)
+    for issue_id in args.ids:
+        if args.verb == "defer":
+            if not args.until:
+                raise Refused("defer needs --until <date>")
+            writer.defer(issue_id, args.until)
+        else:
+            writer.undefer(issue_id)
+    return report_issues(args, writer, args.ids,
+                         "Deferred" if args.verb == "defer" else "Undeferred")
+
+
+def cmd_delete(args, start: Path) -> int:
+    if not args.force:
+        raise Refused(f"delete is permanent; repeat with --force to delete {', '.join(args.ids)}")
+    writer = open_writer(args, start)
+    for issue_id in args.ids:
+        edges = writer.delete(issue_id)
+        print(f"✓ Deleted {issue_id} (removed {edges} dependency link(s))")
+    return 0
+
+
+def cmd_dep(args, start: Path) -> int:
+    writer = open_writer(args, start)
+    if args.action == "add":
+        added = writer.dep_add(args.issue, args.depends_on, args.type)
+        print(f"✓ Added dependency: {args.issue} depends on {args.depends_on} ({args.type})"
+              if added else f"{args.issue} already depends on {args.depends_on} ({args.type})")
+    else:
+        writer.dep_remove(args.issue, args.depends_on)
+        print(f"✓ Removed dependency: {args.issue} no longer depends on {args.depends_on}")
+    return 0
+
+
+def cmd_remember(args, start: Path) -> int:
+    writer = open_writer(args, start)
+    new = writer.remember(args.key or "", args.value)
+    print(f"{'Remembered' if new else 'Updated'} [{args.key}]: {args.value[:PREVIEW]}")
+    return 0
+
+
+def cmd_forget(args, start: Path) -> int:
+    writer = open_writer(args, start)
+    old = writer.forget(args.key)
+    print(f"Forgot [{args.key}]: {old[:PREVIEW]}")
+    return 0
+
+
 # -- argument parsing -------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog=PROG, description="Agent-facing work and memory store (read-only shadow of bd).")
+        prog=PROG, description="Agent-facing work and memory store: a read-only shadow of bd, or a writable store of its own (cairn init).")
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
     parser.add_argument("-C", "--directory", help="run as if started in this directory")
     parser.add_argument("--json", action="store_true", help="print JSON")
@@ -472,7 +708,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-u", "--unassigned", action="store_true")
     p.add_argument("--include-deferred", action="store_true")
     p.add_argument("--claim", action="store_true",
-                   help="refused at this stage: claiming is a write")
+                   help="claim the first ready issue (writable stores only)")
+    p.add_argument("--actor")
     p.set_defaults(func=cmd_ready)
 
     p = sub.add_parser("list", help="list issues (closed hidden unless --all or --status)")
@@ -530,6 +767,107 @@ def build_parser() -> argparse.ArgumentParser:
                         f"{shadow.DEFAULT_DEADLINE_SECONDS:g}s, sync/diff: "
                         f"{shadow.MANUAL_DEADLINE_SECONDS:g}s)")
     p.set_defaults(func=cmd_shadow)
+
+    # Write verbs: writable stores only (cairn init).
+    def writer_parser(name: str, help_text: str) -> argparse.ArgumentParser:
+        w = sub.add_parser(name, help=help_text)
+        w.add_argument("--actor", help="who writes (default: $BEADS_ACTOR)")
+        # bd's global flags that agents type after the verb; meaningless here.
+        w.add_argument("--sandbox", action="store_true", help=argparse.SUPPRESS)
+        w.add_argument("-q", "--quiet", action="store_true", help="print nothing on success")
+        return w
+
+    p = writer_parser("init", "create a writable store in this directory")
+    p.add_argument("-p", "--prefix", required=True, help="issue id prefix")
+    p.set_defaults(func=cmd_init)
+
+    def issue_fields(w: argparse.ArgumentParser) -> None:
+        w.add_argument("-d", "--description")
+        w.add_argument("--design")
+        w.add_argument("--acceptance")
+        w.add_argument("--notes")
+        w.add_argument("-p", "--priority")
+        w.add_argument("-t", "--type")
+        w.add_argument("-a", "--assignee")
+
+    p = writer_parser("create", "create an issue")
+    p.add_argument("title_pos", nargs="?", metavar="title")
+    p.add_argument("--title")
+    issue_fields(p)
+    p.add_argument("--parent")
+    p.add_argument("--id")
+    p.add_argument("-l", "--labels", action="append")
+    p.add_argument("--body-file", help="read the description from a file ('-' = stdin)")
+    p.add_argument("--defer", metavar="DATE", help="create deferred until DATE")
+    p.add_argument("--silent", action="store_true", help="print only the new id")
+    p.set_defaults(func=cmd_create)
+
+    p = writer_parser("update", "change issues")
+    p.add_argument("ids", nargs="+")
+    p.add_argument("--title")
+    issue_fields(p)
+    p.add_argument("--append-notes")
+    p.add_argument("-s", "--status")
+    p.add_argument("--claim", action="store_true")
+    p.add_argument("--add-label", action="append")
+    p.add_argument("--remove-label", action="append")
+    p.add_argument("--body-file", help="read the description from a file ('-' = stdin)")
+    p.add_argument("--defer", metavar="DATE", help="defer until DATE (as `defer --until`)")
+    p.set_defaults(func=cmd_update)
+
+    p = writer_parser("close", "close issues")
+    p.add_argument("ids", nargs="+")
+    p.add_argument("-r", "--reason")
+    p.add_argument("--suggest-next", action="store_true",
+                   help="after closing, list issues this close made ready")
+    p.set_defaults(func=cmd_close)
+
+    p = writer_parser("reopen", "reopen issues")
+    p.add_argument("ids", nargs="+")
+    p.set_defaults(func=cmd_reopen)
+
+    p = writer_parser("note", "append a line to an issue's notes")
+    p.add_argument("id")
+    p.add_argument("text", nargs="?")
+    p.add_argument("--file", help="read the note from a file ('-' = stdin)")
+    p.set_defaults(func=cmd_note)
+
+    p = writer_parser("comment", "add a comment")
+    p.add_argument("id")
+    p.add_argument("text")
+    p.set_defaults(func=cmd_comment, action="add")
+
+    p = writer_parser("comments", "comments <id> (list) | comments add <id> <text>")
+    p.add_argument("words", nargs="+", metavar="add <id> <text> | <id>")
+    p.set_defaults(func=cmd_comments)
+
+    for name in ("defer", "undefer"):
+        p = writer_parser(name, f"{name} issues")
+        p.add_argument("ids", nargs="+")
+        if name == "defer":
+            p.add_argument("--until")
+        p.set_defaults(func=cmd_defer)
+
+    p = writer_parser("delete", "delete issues permanently (--force)")
+    p.add_argument("ids", nargs="+")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_delete)
+
+    p = writer_parser("dep", "add or remove a dependency")
+    p.add_argument("action", choices=("add", "remove", "rm"))
+    p.add_argument("issue")
+    p.add_argument("depends_on")
+    p.add_argument("--type", default="blocks")
+    p.set_defaults(func=cmd_dep)
+
+    p = writer_parser("remember", "set a memory (--key required)")
+    p.add_argument("value")
+    p.add_argument("--key")
+    p.set_defaults(func=cmd_remember)
+
+    p = writer_parser("forget", "delete a memory")
+    p.add_argument("key")
+    p.set_defaults(func=cmd_forget)
     return parser
 
 
@@ -556,7 +894,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 pass
 
     verb = _first_verb(argv)
-    if verb in WRITE_VERBS:
+    if verb in UNSUPPORTED_VERBS:
         return refuse_write(verb)
 
     parser = build_parser()
@@ -577,9 +915,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pass
     try:
         return args.func(args, start)
-    except (StoreError, SourceError, shadow.BdError, Refused) as exc:
+    except (StoreError, SourceError, shadow.BdError, Refused, WriteRefused) as exc:
         print(f"{PROG}: error: {exc}", file=sys.stderr)
         return 2
+    except WriteConflict as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 1
     except BrokenPipeError:
         return 0
     except (OSError, sqlite3.Error) as exc:

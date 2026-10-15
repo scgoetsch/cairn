@@ -4,13 +4,20 @@ An agent-facing store for work tracking and keyed memories: a small SQLite
 database, the verbs and flags of [beads](https://github.com/gastownhall/beads)
 (`bd`), and nothing but the Python standard library.
 
-**Status: a read-only shadow of a beads store.** bd is the only writer. cairn
-rebuilds its database from `bd export --all`, answers the same read questions,
-and diffs its answers against bd's. Write verbs are refused, and so is
-`ready --claim`, bd's claim behind a read verb. Deleting the
-`.cairn/` directory undoes everything. The intent is to run in shadow until the
-two have agreed for long enough, then let cairn write alongside bd, and only
-then consider replacing it.
+**Status: a read-only shadow of a beads store, plus a write engine for stores
+of its own.** A store is one of two kinds:
+
+- a **shadow** (`cairn shadow sync`): rebuilt from `bd export --all`, answering
+  the same read questions and diffed against bd's answers. bd is its only
+  writer; every write verb is refused there. Deleting `.cairn/` undoes
+  everything.
+- a **writable store** (`cairn init`): cairn's own. Write verbs work only here.
+  A shadow can never become writable: only `init` sets the meta keys the write
+  path checks.
+
+The write engine is proven against bd offline — a scripted drill and a replay of
+the bd commands agents actually typed, run against a throwaway bd store and a
+throwaway cairn store side by side (see Tests). No live store is written by both.
 
 ## Install
 
@@ -36,6 +43,40 @@ cairn prime [--budget BYTES]         # default 10000: what Claude Code shows of 
 cairn export [--include-memories | --all] [-o FILE]
 cairn import FILE [--interactions F] [--ledger F] [--hot F]   # build from files, no bd
 ```
+
+Writable stores (`--actor`, else `$BEADS_ACTOR`, else git user.name; a claim
+requires `--actor` or `$BEADS_ACTOR`):
+
+```bash
+cairn init --prefix proj                              # .cairn/ here, writable
+cairn create "Title" [-d TEXT|--body-file F] [-p P] [-t TYPE] [--parent ID] [-l a,b] [--silent]
+cairn update ID... [--claim] [--status S] [--assignee A] [--title T] [-d T] [--notes T]
+                   [--append-notes T] [--design T] [--acceptance T] [-p P] [-t T]
+                   [--add-label L] [--remove-label L] [--defer DATE]
+cairn close ID... [--reason R] [--suggest-next]  |  cairn reopen ID...
+cairn note ID TEXT  |  cairn comment ID TEXT  |  cairn comments [add] ID [TEXT]
+cairn dep add A B [--type blocks|parent-child|related|discovered-from]  |  cairn dep rm A B
+cairn defer ID --until DATE  |  cairn undefer ID  |  cairn delete ID --force
+cairn remember --key KEY BODY  |  cairn forget KEY
+cairn ready --claim                                   # claim the first ready issue
+```
+
+Every write is one SQLite transaction (`BEGIN IMMEDIATE`, WAL, 5 s busy
+timeout) that also appends its history row to `events`; a change cannot commit
+without its event. `update --claim` is a compare-and-swap on the assignee: it
+succeeds when the issue is not closed and unassigned or already the actor's,
+and otherwise exits 1 naming the holder. Taking over is `update --assignee`
+(logged) followed by `--claim`.
+
+Ids: a root id is the prefix, a dash and base-36 characters, as wide as the
+widest root id in the store (at least three), drawn at random until unused;
+the width grows by one only when a width runs out. A child is `<parent>.N`.
+No id and no child number is ever issued twice: every issued id stays in
+`used_ids` after the issue is deleted, and `id_counters` keeps each parent's
+next number.
+
+Memory links are a projection of the bodies: `remember` and `forget` re-derive
+`memory_edges` in the same transaction.
 
 `--json` works before or after the verb, as with bd. `ready` and `list` stop at
 bd's default limits (100 and 50); when a `--json` listing is cut short, cairn
@@ -148,6 +189,24 @@ designed around these:
 
 ## Differences from bd that are deliberate
 
+Writes (each pinned in `tests/test_writer.py` or `tests/test_drill.py`):
+
+- `update --claim` needs an actor; bd falls back to git user.name, which makes
+  every session the same claimant.
+- Stored status `blocked` cannot be written; bd accepts it. Blocked-ness is
+  computed from dependencies (an import still accepts the stored value).
+- A second parent is refused; bd accepts it.
+- `create --id` of an id that exists or ever existed is refused; bd silently
+  replaces the issue (description gone, priority reset, a closed issue open).
+- `update`, `close` and the other verbs need an id; bd acts on the issue it
+  last touched when none is given.
+- `remember` needs `--key`; bd generates one.
+- `delete` without `--force` is refused (exit 2); bd prints a preview and exits
+  0. `delete` does not rewrite mentions of the id in other issues' text; bd does.
+- A usage error (no title) exits 2, where bd exits 1.
+
+Reads:
+
 - `export` is sorted by id, and dependency lists inside a row are sorted, so
   consecutive exports of an unchanged store are byte-identical. Content is equal
   to bd's (the round-trip check).
@@ -176,8 +235,13 @@ explains a link to a deleted key, and flags an issue with more than one parent.
 
 ## Known limits
 
-- Read-only. There is no id allocation, no write path and no locking yet; the
-  database uses SQLite's default journal mode.
+- A shadow is read-only and uses SQLite's default journal mode (it is
+  replaced whole on every sync); writable stores use WAL.
+- `bd import` of `cairn export --all` reproduces every row (measured,
+  `RoundTripTest`), but bd's child counter then restarts from the children it
+  sees and hands out numbers cairn had deleted. A rollback into bd must burn
+  those numbers first. Events and `used_ids` do not travel in the export.
+- `create --id` with a child-shaped id makes no parent link, as in bd.
 - The stored status `blocked` is accepted because bd accepts it, while whether
   an issue *is* blocked is computed from dependencies.
 - Imported history comes from bd's audit log, which records issue field changes
@@ -201,6 +265,24 @@ CAIRN_TEST_WITH_BD=1 python3 -m unittest tests.test_bd_integration
 builds the measured edge cases on a throwaway store with the real `bd` and
 requires a clean comparison, including `bd show` for every issue; a second
 store re-measures id allocation. Run it after upgrading bd.
+
+```bash
+CAIRN_TEST_WITH_BD=1 python3 -m unittest tests.test_drill
+```
+
+runs the same writes against a throwaway bd store and a throwaway writable
+cairn store and compares them field by field (claim, refused second claimant,
+takeover, a blocker hiding and returning an issue, notes, comments, labels,
+close/reopen, defer, memories), asserts the deliberate differences, and imports
+cairn's export into a fresh bd (`RoundTripTest`).
+
+```bash
+python3 tests/replay_corpus.py CORPUS.json [--prefix P]
+```
+
+replays bd write commands harvested from agent transcripts (a JSON list of
+`{"argv": [...], "ts": ...}`; transcripts are private, so no corpus ships)
+against both stores and reports every exit code and field that differs.
 
 ## Licence
 

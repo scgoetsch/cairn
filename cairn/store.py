@@ -15,6 +15,9 @@ CONFIG_FILENAME = "config.json"
 # and logs are derived, the configuration is not.
 GITIGNORE = "*\n!.gitignore\n!config.json\n"
 SCHEMA_VERSION = 1
+# A writer waits this long for another writer's transaction before giving up.
+# Inside the shadow run's 15 s deadline and the session hooks' budgets.
+BUSY_TIMEOUT_MS = 5000
 
 # bd's stored statuses. "blocked" is accepted because bd accepts it as a stored
 # status; whether an issue IS blocked is computed from dependencies (queries.py).
@@ -127,6 +130,19 @@ CREATE TABLE memory_tombstones (
     first_seen TEXT,
     deleted_at TEXT
 );
+
+-- Id allocation (writable stores only; an imported shadow leaves both empty).
+-- used_ids holds every id ever issued and is never deleted from, so a deleted
+-- issue's id is not handed out again. id_counters holds the next child number
+-- per parent; numbers are never reused either (bd's rule, measured).
+CREATE TABLE used_ids (
+    id         TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE id_counters (
+    parent_id TEXT PRIMARY KEY,
+    next_n    INTEGER NOT NULL CHECK (next_n >= 1)
+);
 """
 
 
@@ -211,6 +227,51 @@ def open_db(path: Path) -> sqlite3.Connection:
         conn.close()
         raise StoreError(
             f"{path} has schema version {found}, this build expects {SCHEMA_VERSION}")
+    return conn
+
+
+def init_store(path: Path, prefix: str) -> sqlite3.Connection:
+    """Create a WRITABLE store: the schema, plus meta keys `writable` and
+    `allocator` that an import never sets. A shadow database rebuilt from bd
+    therefore can never be written to by mistake."""
+    if not prefix or not all(c.isalnum() or c in "_-" for c in prefix):
+        raise StoreError(f"invalid issue prefix {prefix!r}")
+    conn = create_db(path)
+    conn.executemany("INSERT INTO meta(key, value) VALUES (?, ?)",
+                     (("writable", "1"), ("allocator", "1"), ("prefix", prefix)))
+    conn.commit()
+    conn.close()
+    return open_writable(path)
+
+
+def open_writable(path: Path) -> sqlite3.Connection:
+    """Open a writable store for one write. WAL so read verbs and session hooks
+    keep reading while a write runs; busy_timeout so concurrent writers wait
+    instead of failing. Autocommit mode: the caller opens BEGIN IMMEDIATE."""
+    if not path.is_file():
+        raise StoreError(f"no store database at {path} — run `cairn init` to create one")
+    conn = sqlite3.connect(str(path), isolation_level=None, timeout=BUSY_TIMEOUT_MS / 1000)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA foreign_keys = ON")
+        row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        if row is None or int(row["value"]) != SCHEMA_VERSION:
+            raise StoreError(f"{path} has schema version {None if row is None else row['value']}, "
+                             f"this build expects {SCHEMA_VERSION}")
+        if get_meta(conn, "writable") != "1":
+            raise StoreError(
+                f"{path} is a read-only shadow of bd (rebuilt from `bd export` on every sync); "
+                "bd is the only writer of this store. Writes go to stores made by `cairn init`.")
+        if conn.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+            conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+    except sqlite3.DatabaseError as exc:
+        conn.close()
+        raise StoreError(f"{path} is not a cairn store: {exc}") from exc
+    except StoreError:
+        conn.close()
+        raise
     return conn
 
 
