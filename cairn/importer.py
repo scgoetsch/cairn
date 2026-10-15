@@ -256,27 +256,35 @@ def export_content(rows: Sequence[Mapping[str, Any]]) -> Dict[Tuple[str, str], D
     return out
 
 
-def verify_round_trip(conn: sqlite3.Connection, export_path: Path) -> bool:
+def verify_round_trip(conn: sqlite3.Connection, export_path: Path,
+                      report: Optional[ImportReport] = None) -> bool:
     """The migration's proof, for any bd version: the new store's export must hold
     exactly what the source held. A difference in content raises (nothing is
-    written); a difference only in layout returns False."""
+    written); a difference only in layout returns False. The counts bd derives
+    (dependency_count, dependent_count, comment_count) are recomputed, not
+    stored: where cairn counts differently, that is reported as a warning."""
     source_text = export_path.read_text(encoding="utf-8")
     source = [json.loads(line) for line in source_text.splitlines() if line.strip()]
     has_memories = any(r.get("_type") == "memory" for r in source)
     lines = export_lines(conn, has_memories)
     want, got = export_content(source), export_content([json.loads(line) for line in lines])
     problems: List[str] = []
+    derived: List[str] = []
     for key in sorted(set(want) | set(got)):
         a, b = want.get(key), got.get(key)
         if a is None or b is None:
             problems.append(f"{key[0]} {key[1]} only in the {'store' if a is None else 'source'}")
             continue
         for name in sorted(set(a) | set(b)):
-            if a.get(name) != b.get(name) and name not in DERIVED_FIELDS:
-                problems.append(f"{key[0]} {key[1]}: '{name}' differs")
+            if a.get(name) != b.get(name):
+                (derived if name in DERIVED_FIELDS else problems).append(
+                    f"{key[0]} {key[1]}: '{name}' differs")
     if problems:
         raise SourceError(f"the new store would not hold what the source holds "
                           f"({len(problems)} difference(s)): " + "; ".join(problems[:8]))
+    if derived and report is not None:
+        report.warnings.append(f"{len(derived)} derived count(s) differ from the source's "
+                               "(cairn counts these itself): " + "; ".join(derived[:5]))
     return "".join(line + "\n" for line in lines) == source_text
 
 
@@ -556,7 +564,7 @@ def build_writable(target: Path, export_path: Path, prefix: str, *,
                          (("writable", "1"), ("allocator", "1"), ("prefix", prefix),
                           ("migrated_from", str(export_path)),
                           *((("bd_version", bd_version),) if bd_version else ())))
-        report.byte_identical = verify_round_trip(conn, export_path)
+        report.byte_identical = verify_round_trip(conn, export_path, report)
         conn.commit()
         conn.close()
         conn = None

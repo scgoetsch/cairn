@@ -351,6 +351,12 @@ explains a link to a deleted key, and flags an issue with more than one parent.
   (measured, `RoundTripTest`), but bd's child counter then restarts from the children it
   sees and hands out numbers cairn had deleted. A rollback into bd must burn
   those numbers first. Events and `used_ids` do not travel in the export.
+- One issue prefix per store. `init --from` refuses an export holding issues under another prefix,
+  and a seed naming one, before it writes anything (`issue_prefixes` in `.cairn/config.json` is
+  for links in memory bodies, not for issues).
+- `seed-from-dolt` copies the Dolt directory as files. A copy taken while bd writes can be torn;
+  it is checked only for holding every current id, so take it in a quiet window (the workspace's
+  `tools/cairn-move.sh` reads it twice and requires both reads to agree).
 - `create --id` with a child-shaped id makes no parent link, as in bd.
 - The stored status `blocked` is accepted because bd accepts it, while whether
   an issue *is* blocked is computed from dependencies.

@@ -144,6 +144,13 @@ class CutoverTest(StoreCase):
         self.assertIs(json.loads(out)["byte_identical"], True)
         self.assertEqual(json.loads(out)["bd_version"], None)
 
+    def test_a_derived_count_that_differs_is_a_warning(self):
+        write_jsonl(self.export, [*rows()[:-2], {**issue("t-z"), "dependency_count": 7},
+                                  *rows()[-2:]])
+        code, out, err = self.init("--json")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(any("derived count" in w for w in json.loads(out)["warnings"]))
+
     def test_prime_says_who_writes(self):
         self.assertEqual(self.init()[0], 0)
         _, out, _ = self.cli("prime")
@@ -416,6 +423,14 @@ class DoltSeedTest(unittest.TestCase):
         self.assertEqual(seed["child_counters"], {"t-a": 2})
         ran_in = set(self.log.read_text().split())
         self.assertNotIn(str(self.beads / "embeddeddolt" / "workspace"), ran_in)
+
+    def test_a_counter_above_every_historical_child_is_kept(self):
+        # bd issued t-a.1..t-a.9, then deleted 5..9 before the history began: only the
+        # counter knows. The seed must carry 9, not the 4 the history alone would give.
+        self.data(history=["t-a", "t-a.1", "t-a.4"], current=["t-a", "t-a.1", "t-a.4"],
+                  counters={"t-a": 9})
+        self.assertEqual(doltseed.read_seed(self.beads, str(self.dolt))["child_counters"],
+                         {"t-a": 9})
 
     def test_version_and_a_store_without_child_counters(self):
         self.data(history=["t-a", "t-a.1", "t-a.4", "t-a.4.2"], current=["t-a"],
