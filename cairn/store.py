@@ -6,7 +6,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 STORE_DIRNAME = ".cairn"
 DB_FILENAME = "cairn.db"
@@ -18,6 +18,11 @@ SCHEMA_VERSION = 1
 # A writer waits this long for another writer's transaction before giving up.
 # Inside the shadow run's 15 s deadline and the session hooks' budgets.
 BUSY_TIMEOUT_MS = 5000
+
+# Schema migrations: MIGRATIONS[n] holds the statements that take a store from
+# version n to n + 1. `cairn migrate` applies them in order, in one transaction,
+# after a backup. A shadow is never migrated: `cairn shadow sync` rebuilds it.
+MIGRATIONS: Dict[int, Sequence[str]] = {}
 
 # bd's stored statuses. "blocked" is accepted because bd accepts it as a stored
 # status; whether an issue IS blocked is computed from dependencies (queries.py).
@@ -222,11 +227,11 @@ def open_db(path: Path) -> sqlite3.Connection:
     except sqlite3.DatabaseError as exc:
         conn.close()
         raise StoreError(f"{path} is not a cairn store: {exc}") from exc
-    if row is None or int(row["value"]) != SCHEMA_VERSION:
-        found = None if row is None else row["value"]
+    try:
+        check_version(path, None if row is None else row["value"])
+    except StoreError:
         conn.close()
-        raise StoreError(
-            f"{path} has schema version {found}, this build expects {SCHEMA_VERSION}")
+        raise
     return conn
 
 
@@ -256,9 +261,7 @@ def open_writable(path: Path) -> sqlite3.Connection:
         conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA foreign_keys = ON")
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        if row is None or int(row["value"]) != SCHEMA_VERSION:
-            raise StoreError(f"{path} has schema version {None if row is None else row['value']}, "
-                             f"this build expects {SCHEMA_VERSION}")
+        check_version(path, None if row is None else row["value"])
         if get_meta(conn, "writable") != "1":
             raise StoreError(
                 f"{path} is a read-only shadow of bd (rebuilt from `bd export` on every sync); "
@@ -278,3 +281,86 @@ def open_writable(path: Path) -> sqlite3.Connection:
 def get_meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
     row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
     return None if row is None else row["value"]
+
+
+def check_version(path: Path, found: Optional[str]) -> None:
+    """Refuse a store of another schema version, saying what fixes it."""
+    if found is not None and found.isdigit() and int(found) == SCHEMA_VERSION:
+        return
+    if found is not None and found.isdigit() and int(found) < SCHEMA_VERSION:
+        raise StoreError(
+            f"{path} has schema version {found}, this build expects {SCHEMA_VERSION}: "
+            "run `cairn migrate` (a writable store) or `cairn shadow sync` (a shadow)")
+    raise StoreError(f"{path} has schema version {found}, this build expects "
+                     f"{SCHEMA_VERSION}: a newer cairn made it; upgrade cairn")
+
+
+def migrate(path: Path, *, migrations: Optional[Mapping[int, Sequence[str]]] = None,
+            target: int = SCHEMA_VERSION) -> Tuple[int, int, Optional[Path]]:
+    """Bring a writable store to schema version `target`. Returns (from, to,
+    backup path or None when nothing needed doing).
+
+    A consistent copy of the database goes to `<db>.v<from>.bak` first. Then,
+    holding the write lock, every step runs in ONE transaction with foreign keys
+    checked before commit: a failed step leaves the store as it was."""
+    steps = MIGRATIONS if migrations is None else migrations
+    if not path.is_file():
+        raise StoreError(f"no store database at {path}")
+    conn = sqlite3.connect(str(path), isolation_level=None, timeout=BUSY_TIMEOUT_MS / 1000)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA foreign_keys = OFF")      # cannot change inside a transaction
+        conn.execute("BEGIN IMMEDIATE")
+        found = get_meta(conn, "schema_version")
+        if found is None or not found.isdigit():
+            raise StoreError(f"{path} is not a cairn store (no schema_version)")
+        if get_meta(conn, "writable") != "1":
+            raise StoreError(f"{path} is a shadow; rebuild it with `cairn shadow sync` "
+                             "instead of migrating it")
+        start = int(found)
+        if start == target:
+            conn.execute("ROLLBACK")
+            return start, start, None
+        if start > target:
+            raise StoreError(f"{path} has schema version {start}, newer than this build's "
+                             f"{target}: upgrade cairn")
+        missing = [v for v in range(start, target) if v not in steps]
+        if missing:
+            raise StoreError(f"no migration from schema version {missing[0]}")
+        backup = path.with_name(f"{path.name}.v{start}.bak")
+        if backup.exists():
+            raise StoreError(f"{backup} already exists; move it away first")
+        # Through a second connection: Python's backup from the connection that
+        # holds the write transaction retries forever (measured). Readers are
+        # allowed under our lock and no writer is, so the copy is consistent.
+        source = sqlite3.connect(str(path), timeout=BUSY_TIMEOUT_MS / 1000)
+        dest = sqlite3.connect(str(backup))
+        try:
+            source.backup(dest)
+        finally:
+            dest.close()
+            source.close()
+        try:
+            for version in range(start, target):
+                for statement in steps[version]:
+                    conn.execute(statement)
+            conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                         (str(target),))
+            broken = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if broken:
+                raise StoreError(f"migration left {len(broken)} broken reference(s); "
+                                 "rolled back")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            backup.unlink()          # the store is unchanged: a retry must not be refused
+            raise
+        conn.execute("COMMIT")
+        return start, target, backup
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()

@@ -21,11 +21,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from . import PROG, __version__, prime, shadow, timeutil
-from .importer import ENV_PREFIXES, SourceError, build_store
-from .queries import LINKED_OMITS, Snapshot, check, memories, recall, stats
+from . import PROG, __version__, doltseed, prime, shadow, timeutil
+from .importer import ENV_PREFIXES, SourceError, build_store, build_writable
+from .queries import (LINKED_OMITS, Snapshot, check, export_order, go_json, memories, recall,
+                      stats)
 from .store import (GITIGNORE, STORE_DIRNAME, StoreError, db_path, find_store_dir,
-                    init_store, load_config, open_db, open_writable)
+                    init_store, load_config, migrate, open_db, open_writable)
 from .writer import WriteConflict, WriteRefused, Writer
 
 GLYPH = {"open": "○", "in_progress": "◐", "blocked": "●", "closed": "✓", "deferred": "❄"}
@@ -319,12 +320,11 @@ def cmd_prime(args, start: Path) -> int:
 def cmd_export(args, start: Path) -> int:
     conn = connect(start)
     snap = Snapshot(conn)
-    lines = [json.dumps(snap.issue_object(i, shape="export"), ensure_ascii=False,
-                        separators=(",", ":")) for i in sorted(snap.issues)]
+    lines = [go_json(snap.issue_object(row["id"], shape="export"))
+             for row in sorted(snap.issues.values(), key=export_order)]
     issue_count = len(lines)
     if args.include_memories or args.all:
-        lines += [json.dumps({"_type": "memory", "key": r["key"], "value": r["value"]},
-                             ensure_ascii=False, separators=(",", ":"))
+        lines += [go_json({"_type": "memory", "key": r["key"], "value": r["value"]})
                   for r in memories(conn)]
     text = "".join(line + "\n" for line in lines)
     if not args.output:
@@ -500,9 +500,63 @@ def cmd_init(args, start: Path) -> int:
     store = start / STORE_DIRNAME
     if db_path(store).exists():
         raise Refused(f"{db_path(store)} already exists")
+    sources = (args.seed, args.interactions, args.ledger, args.hot)
+    if not args.source and any(sources):
+        raise Refused("--seed, --interactions, --ledger and --hot need --from")
+    for option in (args.source, *sources):
+        if option and not Path(option).is_file():
+            raise Refused(f"no such file: {option}")
     ensure_store_dir(store)
-    init_store(db_path(store), args.prefix).close()
-    print(f"Initialised a writable cairn store at {store} (prefix {args.prefix})")
+    if not args.source:
+        init_store(db_path(store), args.prefix).close()
+        if not args.quiet:
+            print(f"Initialised a writable cairn store at {store} (prefix {args.prefix})")
+        return 0
+    report = build_writable(
+        db_path(store), Path(args.source), args.prefix,
+        seed_path=Path(args.seed) if args.seed else None,
+        interactions_path=Path(args.interactions) if args.interactions else None,
+        ledger_path=Path(args.ledger) if args.ledger else None,
+        hot_path=Path(args.hot) if args.hot else None,
+        extra_prefixes=load_config(store).get("issue_prefixes", []))
+    if args.json:
+        emit_json({"store": str(store), "counts": report.counts, "warnings": report.warnings})
+    elif not args.quiet:
+        print(f"Initialised a writable cairn store at {store} (prefix {args.prefix}) from "
+              f"{args.source}: " + ", ".join(f"{n} {k}" for k, n in report.counts.items()))
+        for warning in report.warnings:
+            print(f"⚠ {warning}")
+    return 0
+
+
+def cmd_migrate(args, start: Path) -> int:
+    store = find_store_dir(start)
+    if store is None:
+        raise Refused(f"no {STORE_DIRNAME}/ store found from {start} upwards")
+    before, after, backup = migrate(db_path(store))
+    if args.json:
+        emit_json({"from": before, "to": after, "backup": str(backup) if backup else None})
+    elif backup is None:
+        print(f"{db_path(store)} is at schema version {after}; nothing to do")
+    else:
+        print(f"Migrated {db_path(store)} from schema version {before} to {after} "
+              f"(backup: {backup})")
+    return 0
+
+
+def cmd_seed_from_dolt(args, start: Path) -> int:
+    try:
+        seed = doltseed.read_seed(Path(args.source), args.dolt)
+    except doltseed.DoltError as exc:
+        raise Refused(str(exc)) from exc
+    text = json.dumps(seed, indent=1, sort_keys=True) + "\n"
+    if args.output:
+        Path(args.output).write_text(text, encoding="utf-8")
+        print(f"Seed written to {args.output}: {len(seed['used_ids'])} ids ever issued "
+              f"({len(seed['deleted_ids'])} deleted), {len(seed['child_counters'])} "
+              "child counters", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
     return 0
 
 
@@ -801,7 +855,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = writer_parser("init", "create a writable store in this directory")
     p.add_argument("-p", "--prefix", required=True, help="issue id prefix")
+    p.add_argument("--from", dest="source", metavar="EXPORT",
+                   help="build it from a `bd export --all` file (the cutover from bd)")
+    p.add_argument("--seed", help="allocator seed from `cairn seed-from-dolt` (ids bd "
+                                  "deleted, bd's child counters)")
+    p.add_argument("--interactions", help="bd interactions.jsonl (becomes the event history)")
+    p.add_argument("--ledger", help="bd-memgraph ledger (memory timestamps and deletions)")
+    p.add_argument("--hot", help="hot list: one memory key per line")
     p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("migrate", help="bring a writable store to this build's schema")
+    p.set_defaults(func=cmd_migrate)
+
+    p = sub.add_parser("seed-from-dolt", help="read the allocator seed from a copy of "
+                                              "bd's Dolt store")
+    p.add_argument("source", help="the .beads directory or the Dolt repository in it")
+    p.add_argument("--dolt", default="dolt", help="dolt executable (bd ships none)")
+    p.add_argument("-o", "--output", help="write the seed here (default: stdout)")
+    p.set_defaults(func=cmd_seed_from_dolt)
 
     def issue_fields(w: argparse.ArgumentParser) -> None:
         w.add_argument("-d", "--description")

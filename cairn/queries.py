@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 from . import timeutil
@@ -36,6 +37,21 @@ ISSUE_KEY_ORDER = (
     "comments", "defer_until", "labels", "dependencies", "parent",
     "dependency_count", "dependent_count", "comment_count",
 )
+# Key order of an exported issue: the field order of bd's Issue struct (bd 1.1.2
+# internal/types/types.go), which encoding/json follows; the counts come last.
+# Keys cairn carries opaquely (in `extra`) land in their bd position too.
+EXPORT_KEY_ORDER = (
+    "_type", "id", "title", "description", "design", "acceptance_criteria", "notes",
+    "spec_id", "status", "priority", "issue_type", "assignee", "owner",
+    "estimated_minutes", "created_at", "created_by", "updated_at", "started_at",
+    "closed_at", "close_reason", "closed_by_session", "due_at", "defer_until",
+    "external_ref", "source_system", "metadata", "compaction_level", "compacted_at",
+    "compacted_at_commit", "original_size", "labels", "dependencies", "comments",
+    "sender", "ephemeral", "no_history", "wisp_type", "pinned", "is_template",
+    "bonded_from", "await_type", "await_id", "timeout", "waiters", "source_formula",
+    "source_location", "mol_type", "work_type", "event_kind", "actor", "target", "payload",
+    "dependency_count", "dependent_count", "comment_count",
+)
 # Keys bd leaves out of an issue nested under `dependencies` in `show`, and out
 # of the objects printed by `blocked`.
 LINKED_OMITS = ("dependencies", "parent", "dependency_count", "dependent_count",
@@ -47,6 +63,39 @@ TEXT_COLUMNS = (
 )
 
 
+# bd keys a dependency row by a UUIDv5 of (issue, target) and lists an issue's
+# dependencies in that key's order (bd 1.1.2 internal/storage/depid; measured on
+# every multi-dependency issue in the workspace store). Sorting the same way makes
+# cairn's export byte-identical to bd's, so the tracked JSONL does not churn.
+BD_DEPID_NAMESPACE = uuid.UUID("bdd74eb9-a20a-554a-985b-54b8f3e64d8b")
+
+
+def bd_dependency_id(issue_id: str, target: str) -> str:
+    return str(uuid.uuid5(BD_DEPID_NAMESPACE, issue_id + "\x1f" + target))
+
+
+def export_order(row: Any) -> Any:
+    """bd's export row order: priority, newest first, then id (measured on bd
+    1.1.2: ORDER BY priority, created_at DESC over an id-ordered scan; created_at
+    has one-second resolution, so same-second issues fall back to id)."""
+    stamp = row["created_at"] or ""
+    return (row["priority"], tuple(-ord(c) for c in stamp), row["id"])
+
+
+_GO_ESCAPES = {"<": "\\u003c", ">": "\\u003e", "&": "\\u0026",
+               "\u2028": "\\u2028", "\u2029": "\\u2029"}
+
+
+def go_json(obj: Any) -> str:
+    """One compact JSON line as Go's encoding/json writes it: bd escapes <, >, &
+    and U+2028/U+2029. The five characters only occur inside strings, so the
+    replacement cannot touch JSON syntax."""
+    text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    for char, escaped in _GO_ESCAPES.items():
+        text = text.replace(char, escaped)
+    return text
+
+
 class Snapshot:
     """Everything the read verbs need, loaded once. The store is small (hundreds
     of issues), so computing in Python is simpler to verify than recursive SQL."""
@@ -54,8 +103,9 @@ class Snapshot:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.issues: Dict[str, sqlite3.Row] = {
             row["id"]: row for row in conn.execute("SELECT * FROM issues")}
-        self.deps: List[sqlite3.Row] = list(conn.execute(
-            "SELECT * FROM dependencies ORDER BY issue_id, depends_on_id, type"))
+        self.deps: List[sqlite3.Row] = sorted(
+            conn.execute("SELECT * FROM dependencies"),
+            key=lambda d: (d["issue_id"], bd_dependency_id(d["issue_id"], d["depends_on_id"])))
         self.labels: Dict[str, List[str]] = {}
         for row in conn.execute("SELECT issue_id, label FROM labels ORDER BY issue_id, label"):
             self.labels.setdefault(row["issue_id"], []).append(row["label"])
@@ -246,7 +296,8 @@ class Snapshot:
         obj["dependent_count"] = sum(1 for d in self.dependents_of.get(issue_id, [])
                                      if counted(d))
         obj["comment_count"] = len(comments)
-        rank = {name: i for i, name in enumerate(ISSUE_KEY_ORDER)}
+        order = EXPORT_KEY_ORDER if shape == "export" else ISSUE_KEY_ORDER
+        rank = {name: i for i, name in enumerate(order)}
         return dict(sorted(obj.items(), key=lambda kv: (rank.get(kv[0], len(rank)), kv[0])))
 
     def _linked(self, issue_id: str, dep_type: str) -> Dict[str, Any]:

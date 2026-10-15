@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import uuid
 from collections import Counter
@@ -31,7 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 from . import links, timeutil
-from .store import STATUSES, StoreError, create_db
+from .store import STATUSES, StoreError, create_db, open_writable
 
 ISSUE_COLUMNS = (
     "id", "title", "description", "design", "acceptance_criteria", "notes",
@@ -356,6 +357,101 @@ def build_store(target: Path, export_path: Path, **sources: Any) -> ImportReport
         conn.close()
         conn = None
         os.replace(temp, target)
+        return report
+    finally:
+        if conn is not None:
+            conn.close()
+        for leftover in (temp, temp.with_name(temp.name + "-journal")):
+            if leftover.exists():
+                leftover.unlink()
+
+
+CHILD_ID = re.compile(r"^(.+)\.(\d+)$")
+
+
+def load_seed(path: Optional[Path]) -> Tuple[Set[str], Dict[str, int]]:
+    """An allocator seed: {"used_ids": [every id bd ever issued, deleted ones
+    included], "child_counters": {parent: last child number bd issued}}. No
+    export carries deleted ids, so the seed comes from bd's Dolt history
+    (`cairn seed-from-dolt`)."""
+    if path is None:
+        return set(), {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SourceError(f"{path}: not a readable JSON seed ({exc})") from exc
+    used = data.get("used_ids") if isinstance(data, dict) else None
+    counters = data.get("child_counters") if isinstance(data, dict) else None
+    if not isinstance(used, list) or not all(isinstance(i, str) and i for i in used):
+        raise SourceError(f"{path}: 'used_ids' must be a list of ids")
+    if not isinstance(counters, dict) or not all(
+            isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v >= 0
+            for k, v in counters.items()):
+        raise SourceError(f"{path}: 'child_counters' must map parent ids to numbers >= 0")
+    return set(used), dict(counters)
+
+
+def seed_allocator(conn: sqlite3.Connection, prefix: str, used: Set[str],
+                   counters: Mapping[str, int]) -> Dict[str, int]:
+    """Fill used_ids and id_counters so that no id or child number the source
+    ever issued is issued again: used_ids = imported ids + seed ids; a parent's
+    next child number is one past the highest of its seed counter and every
+    child number seen."""
+    now = timeutil.now_iso()
+    imported = {row[0]: row[1] for row in conn.execute("SELECT id, created_at FROM issues")}
+    foreign = sorted(i for i in used if not i.startswith(f"{prefix}-"))
+    if foreign:
+        raise SourceError(f"seed names ids outside prefix '{prefix}-': {', '.join(foreign[:5])}")
+    for issue_id, created in imported.items():
+        conn.execute("INSERT INTO used_ids(id, created_at) VALUES (?, ?)", (issue_id, created))
+    seed_only = sorted(used - set(imported))
+    for issue_id in seed_only:
+        conn.execute("INSERT INTO used_ids(id, created_at) VALUES (?, ?)", (issue_id, now))
+    next_n: Dict[str, int] = {p: n + 1 for p, n in counters.items()}
+    for issue_id in (*imported, *seed_only):
+        match = CHILD_ID.match(issue_id)
+        if match:
+            parent, n = match.group(1), int(match.group(2))
+            next_n[parent] = max(next_n.get(parent, 1), n + 1)
+    for parent, n in sorted(next_n.items()):
+        conn.execute("INSERT INTO id_counters(parent_id, next_n) VALUES (?, ?)", (parent, n))
+    return {"used_ids": len(imported) + len(seed_only), "seed_only_ids": len(seed_only),
+            "id_counters": len(next_n)}
+
+
+def build_writable(target: Path, export_path: Path, prefix: str, *,
+                   seed_path: Optional[Path] = None, **sources: Any) -> ImportReport:
+    """Create a WRITABLE store at `target` from a bd export: the cutover from bd.
+    All or nothing, and only when the copy is faithful: an import with losses,
+    or issues under another prefix, is refused and nothing is written."""
+    if target.exists():
+        raise StoreError(f"{target} already exists")
+    used, counters = load_seed(seed_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(f"{target.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    conn = None
+    try:
+        conn = create_db(temp)
+        report = import_into(conn, export_path, **sources)
+        if report.losses:
+            raise SourceError("the export cannot be represented faithfully: "
+                              + "; ".join(report.losses))
+        stray = [r[0] for r in conn.execute("SELECT id FROM issues")
+                 if not r[0].startswith(f"{prefix}-")]
+        if stray:
+            raise SourceError(f"issues outside prefix '{prefix}-': {', '.join(stray[:5])}")
+        report.counts.update(seed_allocator(conn, prefix, used, counters))
+        conn.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                         (("writable", "1"), ("allocator", "1"), ("prefix", prefix),
+                          ("migrated_from", str(export_path))))
+        conn.commit()
+        conn.close()
+        conn = None
+        try:
+            os.link(temp, target)    # atomic, and fails rather than replace a store
+        except FileExistsError as exc:
+            raise StoreError(f"{target} already exists") from exc
+        open_writable(target).close()  # WAL on, and the result opens as a writable store
         return report
     finally:
         if conn is not None:

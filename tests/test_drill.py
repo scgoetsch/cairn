@@ -208,11 +208,12 @@ class RoundTripTest(unittest.TestCase):
 
     def test_export_imports_into_bd_unchanged(self) -> None:
         c = self.cairn
-        root = c.new("Root", "-d", "desc", "-l", "x,y", "-p", "1")
+        root = c.new("Root", "-d", "a <tag> & more", "-l", "x,y", "-p", "1")
         kid = c.new("Kid", "--parent", root, "-t", "bug")
         blk = c.new("Blk")
         gone = c.new("Gone", "--parent", root)
-        for argv in (("dep", "add", root, blk), ("comment", root, "hello"),
+        for argv in (("dep", "add", root, blk), ("dep", "add", root, kid, "--type", "related"),
+                     ("comment", root, "hello"),
                      ("update", kid, "--claim"), ("close", blk, "--reason", "r"),
                      ("note", root, "n1"), ("defer", root, "--until", "2099-01-01"),
                      ("remember", "--key", "mem-one", "body [[mem-two]]"),
@@ -227,6 +228,8 @@ class RoundTripTest(unittest.TestCase):
             parsed = [json.loads(line) for line in text.splitlines() if line.strip()]
             return {(r.get("_type", "issue"), r.get("id") or r.get("key")): r for r in parsed}
         self.assertEqual(rows(out), rows(export.read_text(encoding="utf-8")))
+        # and byte for byte: row order, key order, dependency order, escaping
+        self.assertEqual(out, export.read_text(encoding="utf-8"))
 
         # The hazard: bd hands out the deleted child's number again; cairn does not.
         _, nxt, _ = self.bd.run("create", "--silent", "--title", "after", "--parent", root,

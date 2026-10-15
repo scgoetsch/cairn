@@ -5,7 +5,7 @@ rebuilds from bd's export and diffs against bd (bd stays its only writer), and a
 WRITABLE store made by `cairn init`, which cairn writes itself.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # The CLI name. bd's verbs and flags are kept, so porting a hook is a matter of
 # swapping this name for `bd` in the hook script.

@@ -42,13 +42,15 @@ cairn memories [keyword] | recall KEY
 cairn prime [--budget BYTES]         # default 10000: what Claude Code shows of a hook in full
 cairn export [--include-memories | --all] [-o FILE]
 cairn import FILE [--interactions F] [--ledger F] [--hot F]   # build from files, no bd
+cairn seed-from-dolt BEADS_DIR [--dolt PATH] [-o FILE]        # allocator seed, see below
+cairn migrate                                                 # writable store -> this schema
 ```
 
 Writable stores (`--actor`, else `$BEADS_ACTOR`, else git user.name; a claim
 requires `--actor` or `$BEADS_ACTOR`):
 
 ```bash
-cairn init --prefix proj                              # .cairn/ here, writable
+cairn init --prefix proj [--from EXPORT [--seed F] [--interactions F] [--ledger F] [--hot F]]
 cairn create "Title" [-d TEXT|--body-file F] [-p P] [-t TYPE] [--parent ID] [-l a,b] [--silent]
 cairn update ID... [--claim] [--status S] [--assignee A] [--title T] [-d T] [--notes T]
                    [--append-notes T] [--design T] [--acceptance T] [-p P] [-t T]
@@ -77,6 +79,36 @@ next number.
 
 Memory links are a projection of the bodies: `remember` and `forget` re-derive
 `memory_edges` in the same transaction.
+
+### Moving a bd store over
+
+```bash
+cairn seed-from-dolt .beads --dolt PATH/TO/dolt -o seed.json   # read-only, on a copy
+bd export --all -o bd.jsonl
+cairn init -p proj --from bd.jsonl --seed seed.json \
+           --interactions .beads/interactions.jsonl --ledger .beads/memgraph-ledger.json
+cairn migrate                     # later: bring a writable store to a newer schema
+```
+
+`init --from` builds a writable store from a bd export, all or nothing. It
+refuses an export it cannot represent faithfully (a row type it does not know,
+an issue under another prefix) and never replaces an existing store. The id
+allocator is seeded so that nothing bd ever issued is issued again: `used_ids`
+gets every imported id plus every id in the seed, and each parent's next child
+number is one past both bd's counter and the highest child number seen.
+
+No bd export carries the ids bd deleted, and bd's child counters live only in
+its database, so the seed comes from Dolt: `seed-from-dolt` copies the Dolt
+repository to a temporary directory and reads, from the copy, every id in the
+history of `issues` and bd's `child_counters`. bd embeds Dolt and ships no CLI;
+any dolt release that reads the store works (measured with 2.4.2 on bd 1.1.2).
+
+`migrate` applies the numbered steps in `store.MIGRATIONS`. It holds the write
+lock, writes `cairn.db.v<N>.bak` first, runs every step in one transaction,
+checks foreign keys before committing, and removes the backup again if a step
+fails (the store is then unchanged). A shadow is never migrated; `shadow sync`
+rebuilds it. A store of an older schema version is refused by every verb with
+a pointer to `cairn migrate`.
 
 Write semantics measured on bd 1.1.2 and matched (pinned in `tests/test_drill.py`
 and `tests/test_writer.py`): `close` leaves `assignee` and `started_at`;
@@ -228,9 +260,12 @@ Writes (each pinned in `tests/test_writer.py` or `tests/test_drill.py`):
 
 Reads:
 
-- `export` is sorted by id, and dependency lists inside a row are sorted, so
-  consecutive exports of an unchanged store are byte-identical. Content is equal
-  to bd's (the round-trip check).
+- `export` is byte-identical to bd's: rows by priority, then newest first, then
+  id; keys in the field order of bd's Issue struct; an issue's dependencies in
+  the order of bd's UUIDv5 edge id (bd 1.1.2 `internal/storage/depid`); `<`, `>`,
+  `&`, U+2028 and U+2029 escaped as Go's encoding/json does. Measured on the
+  workspace store (244 issues, 49 memories: `cmp` equal) and pinned against real
+  bd by `RoundTripTest`. Consecutive exports of an unchanged store are equal.
 - `show --json` adds `dependents` and `comments`; bd's prints neither. Every key
   bd prints is present with the same value.
 - `blocked_by` is sorted; bd's order is unspecified.
@@ -258,8 +293,8 @@ explains a link to a deleted key, and flags an issue with more than one parent.
 
 - A shadow is read-only and uses SQLite's default journal mode (it is
   replaced whole on every sync); writable stores use WAL.
-- `bd import` of `cairn export --all` reproduces every row (measured,
-  `RoundTripTest`), but bd's child counter then restarts from the children it
+- `bd import` of `cairn export --all` reproduces the export byte for byte
+  (measured, `RoundTripTest`), but bd's child counter then restarts from the children it
   sees and hands out numbers cairn had deleted. A rollback into bd must burn
   those numbers first. Events and `used_ids` do not travel in the export.
 - `create --id` with a child-shaped id makes no parent link, as in bd.
