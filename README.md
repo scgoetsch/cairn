@@ -53,12 +53,12 @@ cairn create "Title" [-d TEXT|--body-file F] [-p P] [-t TYPE] [--parent ID] [-l 
 cairn update ID... [--claim] [--status S] [--assignee A] [--title T] [-d T] [--notes T]
                    [--append-notes T] [--design T] [--acceptance T] [-p P] [-t T]
                    [--add-label L] [--remove-label L] [--defer DATE]
-cairn close ID... [--reason R] [--suggest-next]  |  cairn reopen ID...
+cairn close ID... [--reason R] [--force] [--suggest-next]  |  cairn reopen ID...
 cairn note ID TEXT  |  cairn comment ID TEXT  |  cairn comments [add] ID [TEXT]
 cairn dep add A B [--type blocks|parent-child|related|discovered-from]  |  cairn dep rm A B
-cairn defer ID --until DATE  |  cairn undefer ID  |  cairn delete ID --force
+cairn defer ID --until WHEN  |  cairn undefer ID  |  cairn delete ID --force
 cairn remember --key KEY BODY  |  cairn forget KEY
-cairn ready --claim                                   # claim the first ready issue
+cairn ready --claim [ready's filters]                 # claim the first issue ready lists
 ```
 
 Every write is one SQLite transaction (`BEGIN IMMEDIATE`, WAL, 5 s busy
@@ -77,6 +77,23 @@ next number.
 
 Memory links are a projection of the bodies: `remember` and `forget` re-derive
 `memory_edges` in the same transaction.
+
+Write semantics measured on bd 1.1.2 and matched (pinned in `tests/test_drill.py`
+and `tests/test_writer.py`): `close` leaves `assignee` and `started_at`;
+`reopen` clears `closed_at` and `close_reason`; closing a closed issue changes
+nothing; `close` refuses an issue with an open `blocks` dependency (exit 1)
+unless `--force`; a closed or deferred issue is not claimable (exit 1);
+`--status in_progress` is not a claim (no compare-and-swap, the assignee
+stays); `ready --claim` skips a ready issue assigned to someone else; `note`
+appends a line to `notes`; `dep rm A B` removes every edge from A to B whatever
+its type; `delete` removes the edges into the issue too. A WHEN for `defer`
+and `--defer` is an ISO date or timestamp, `+Nh`, `+Nd`, `+Nw` or `tomorrow`,
+checked before anything is written.
+
+`delete` records the whole issue (row, labels, comments, edges) in its event,
+and each surviving issue that lost an edge gets its own `dependency_removed`
+event. A shadow is never replaced over a writable store: `shadow sync`,
+`shadow run` and `import` refuse a target that `cairn init` made.
 
 `--json` works before or after the verb, as with bd. `ready` and `list` stop at
 bd's default limits (100 and 50); when a `--json` listing is cut short, cairn
@@ -174,8 +191,8 @@ Not measured (bd refuses to close an issue with an open blocker): whether a
 closed issue can count as blocked. cairn assumes it cannot.
 
 How bd allocates ids, measured the same way and pinned by `IdAllocationTest` in
-`tests/test_bd_integration.py`. cairn allocates none yet; a writer has to be
-designed around these:
+`tests/test_bd_integration.py`. cairn's allocator (writable stores) is designed
+around these and refuses the last one:
 
 - A root id is the prefix, a dash and three characters of `[0-9a-z]` in a small
   store; it is not a function of the title.
@@ -204,6 +221,10 @@ Writes (each pinned in `tests/test_writer.py` or `tests/test_drill.py`):
 - `delete` without `--force` is refused (exit 2); bd prints a preview and exits
   0. `delete` does not rewrite mentions of the id in other issues' text; bd does.
 - A usage error (no title) exits 2, where bd exits 1.
+- bd verbs `claim`, `supersede`, `duplicate` and `edit` are not implemented and
+  exit 2 (use `update --claim` or `ready --claim` to claim).
+- `--json` on `dep`, `delete`, `remember` and `forget` prints a small status
+  object of cairn's own.
 
 Reads:
 

@@ -113,8 +113,10 @@ def main() -> int:
             for issue_id in ids_in(argv, args.prefix):
                 if issue_id not in seeded:
                     for side in (bd, cairn):
-                        side.run("create", "--silent", "--id", issue_id, "--title", issue_id,
-                                 actor="seed")
+                        code, _, err = side.run("create", "--silent", "--id", issue_id,
+                                                "--title", issue_id, actor="seed")
+                        if code != 0:
+                            print(f"seed {issue_id} failed on {side.kind}: {err.strip()[:120]}")
                     seeded.add(issue_id)
             rest = argv[1:]
             verb = next((t for t in rest if not t.startswith("-")), "")
@@ -158,7 +160,9 @@ def main() -> int:
                       if sb["memories"].get(k) != sc["memories"].get(k))
     print(f"memories: bd {len(sb['memories'])}, cairn {len(sc['memories'])}; differing keys: "
           f"{len(mem_diff)} {mem_diff[:10]}")
-    return 0
+    # Nonzero when anything differs: each difference must be explained (a
+    # deliberate one is listed in the README) before a run counts as clean.
+    return 1 if differs or field_diffs or only or mem_diff else 0
 
 
 if __name__ == "__main__":

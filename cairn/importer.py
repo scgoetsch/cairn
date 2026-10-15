@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 from . import links, timeutil
-from .store import STATUSES, create_db
+from .store import STATUSES, StoreError, create_db
 
 ISSUE_COLUMNS = (
     "id", "title", "description", "design", "acceptance_criteria", "notes",
@@ -323,8 +323,29 @@ def import_into(conn: sqlite3.Connection, export_path: Path, *,
     return report
 
 
+def refuse_if_writable(target: Path) -> None:
+    """A store made by `cairn init` is state, not a derived copy: replacing it
+    would destroy its issues, history and id counters, and leave its WAL files
+    paired with a different database. Refuse."""
+    if not target.is_file():
+        return
+    try:
+        conn = sqlite3.connect(target.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key = 'writable'").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        return                               # not a cairn store: the old behaviour stands
+    if row is not None and row[0] == "1":
+        raise StoreError(f"{target} is a writable cairn store (cairn init); refusing to "
+                         "replace it with an import. Sync or import into another directory.")
+
+
 def build_store(target: Path, export_path: Path, **sources: Any) -> ImportReport:
-    """Build `target` from scratch, atomically replacing any previous database."""
+    """Build `target` from scratch, atomically replacing any previous database —
+    never a writable one."""
+    refuse_if_writable(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     # pid alone is not unique: two containers sharing a mount can both be pid 1.
     temp = target.with_name(f"{target.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")

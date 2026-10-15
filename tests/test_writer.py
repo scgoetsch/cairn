@@ -156,7 +156,8 @@ class FieldTest(WritableCase):
         self.w("close", issue_id, "--reason", "done it")
         self.assertEqual(self.row(issue_id)["close_reason"], "done it")
         status_event = [json.loads(e["data"]) for e in self.events(issue_id)
-                        if e["kind"] == "field_change"][-1]
+                        if e["kind"] == "field_change"
+                        and json.loads(e["data"])["field"] == "status"][-1]
         self.assertEqual(status_event, {"field": "status", "old_value": "open",
                                         "new_value": "closed", "reason": "done it"})
 
@@ -300,10 +301,10 @@ class DependencyTest(WritableCase):
 
     def test_self_and_unknown(self):
         a = self.new("a")
-        for argv in (["dep", "add", a, a], ["dep", "add", a, "t-nope"],
-                     ["dep", "add", a, a, "--type", "frobs"]):
+        for argv, want in ((["dep", "add", a, a], 2), (["dep", "add", a, "t-nope"], 1),
+                           (["dep", "add", a, a, "--type", "frobs"], 2)):
             code, _, _ = self.cli(*argv, "--actor", "x")
-            self.assertIn(code, (1, 2), argv)
+            self.assertEqual(code, want, argv)
 
     def test_delete_removes_edges_both_ways(self):
         a, b, c = self.new("a"), self.new("b"), self.new("c")
@@ -381,9 +382,142 @@ class TransactionTest(WritableCase):
         self.addCleanup(conn.close)
         with self.assertRaises(sqlite3.DatabaseError):
             conn.execute("DELETE FROM events WHERE issue_id = ?", (issue_id,))
+        with self.assertRaises(sqlite3.DatabaseError):
+            conn.execute("UPDATE events SET data = '{}' WHERE issue_id = ?", (issue_id,))
 
     def test_writable_store_is_in_wal_mode(self):
         self.new("x")
         conn = open_db(db_path(self.store_dir))
         self.addCleanup(conn.close)
         self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+
+
+class ReviewFindingsTest(WritableCase):
+    """Defects found by the 2026-10-15 peer review (grok + agy) of f86445c."""
+
+    def count_events(self) -> int:
+        conn = open_db(db_path(self.store_dir))
+        self.addCleanup(conn.close)
+        return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+    def test_shadow_sync_and_import_refuse_to_replace_a_writable_store(self):
+        keep = self.new("keep me")
+        export = self.workspace / "x.jsonl"
+        export.write_text(json.dumps({"_type": "issue", "id": "t-new", "title": "n",
+                                      "status": "open", "priority": 2, "issue_type": "task",
+                                      "created_at": "2026-01-01T00:00:00Z",
+                                      "updated_at": "2026-01-01T00:00:00Z"}) + "\n")
+        code, _, err = self.cli("import", str(export))
+        self.assertEqual(code, 2)
+        self.assertIn("writable cairn store", err)
+        from cairn.importer import build_store
+        from cairn.store import StoreError
+        with self.assertRaises(StoreError):
+            build_store(db_path(self.store_dir), export)     # the path shadow sync takes
+        self.assertIn(keep, self.snap().issues)
+
+    def test_defer_is_validated_before_anything_is_written(self):
+        code, _, err = self.cli("create", "--title", "x", "--defer", "next-friday", "--actor", "a")
+        self.assertEqual(code, 2, err)
+        self.assertEqual(self.snap().issues, {})
+        issue_id = self.new("y")
+        before = self.count_events()
+        code, _, _ = self.cli("update", issue_id, "--title", "z", "--defer", "soon", "--actor", "a")
+        self.assertEqual(code, 2)
+        self.assertEqual((self.row(issue_id)["title"], self.count_events()), ("y", before))
+
+    def test_relative_defer_dates(self):
+        issue_id = self.new("x", "--defer", "+30d")
+        row = self.row(issue_id)
+        self.assertEqual(row["status"], "deferred")
+        self.assertRegex(row["defer_until"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        for when in ("+2w", "+3h", "tomorrow", "2027-02-03"):
+            self.w("defer", issue_id, "--until", when)
+
+    def test_closing_a_closed_issue_changes_nothing(self):
+        issue_id = self.new("x")
+        self.w("close", issue_id, "--reason", "one")
+        before, closed_at = self.count_events(), self.row(issue_id)["closed_at"]
+        out = self.w("close", issue_id, "--reason", "two")
+        self.assertIn("already closed", out)
+        row = self.row(issue_id)
+        self.assertEqual((row["close_reason"], row["closed_at"], self.count_events()),
+                         ("one", closed_at, before))
+
+    def test_close_with_an_open_blocker_needs_force(self):
+        work, blocker = self.new("work"), self.new("blocker")
+        self.w("dep", "add", work, blocker)
+        code, _, err = self.cli("close", work, "--actor", "a")
+        self.assertEqual(code, 1)
+        self.assertIn(f"blocked by open issues [{blocker}]", err)
+        self.assertEqual(self.row(work)["status"], "open")
+        self.w("close", work, "--force")
+        self.assertEqual(self.row(work)["status"], "closed")
+
+    def test_a_deferred_issue_is_not_claimable(self):
+        issue_id = self.new("x", "--defer", "+1w")
+        code, _, err = self.cli("update", issue_id, "--claim", "--actor", "A")
+        self.assertEqual(code, 1)
+        self.assertIn("not claimable: status deferred", err)
+
+    def test_every_column_change_has_an_event(self):
+        issue_id = self.new("x")
+        self.w("update", issue_id, "--claim", actor="A")
+        self.w("close", issue_id, "--reason", "r", actor="A")
+        fields = {json.loads(e["data"])["field"] for e in self.events(issue_id)
+                  if e["kind"] == "field_change"}
+        self.assertTrue({"assignee", "status", "started_at", "closed_at", "close_reason"} <= fields,
+                        fields)
+
+    def test_reclaim_by_the_holder_writes_nothing(self):
+        issue_id = self.new("x")
+        self.w("update", issue_id, "--claim", actor="A")
+        before = self.count_events()
+        self.w("update", issue_id, "--claim", actor="A")
+        self.assertEqual(self.count_events(), before)
+
+    def test_delete_records_survivors_and_the_whole_record(self):
+        a, b = self.new("a"), self.new("b", "-l", "keep")
+        self.w("dep", "add", a, b)
+        self.w("comment", b, "a comment")
+        self.w("delete", b, "--force")
+        lost = [json.loads(e["data"]) for e in self.events(a) if e["kind"] == "dependency_removed"]
+        self.assertEqual(lost, [{"depends_on_id": b, "type": "blocks", "reason": "target deleted"}])
+        gone = [json.loads(e["data"]) for e in self.events(b) if e["kind"] == "deleted"][0]
+        self.assertEqual((gone["issue"]["title"], gone["labels"], gone["comments"][0]["text"]),
+                         ("b", ["keep"], "a comment"))
+
+    def test_an_explicit_child_shaped_id_moves_the_counter(self):
+        parent = self.new("p")
+        self.new("explicit", "--id", f"{parent}.5")
+        self.assertEqual(self.new("next", "--parent", parent), f"{parent}.6")
+
+    def test_ready_claim_uses_the_ready_filters(self):
+        self.new("urgent", "-p", "0")
+        low = self.new("low", "-p", "3")
+        code, out, err = self.cli("ready", "--claim", "-p", "3", "--json", "--actor", "A")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)[0]["id"], low)
+
+    def test_ready_claim_with_everything_held_elsewhere(self):
+        issue_id = self.new("x")
+        self.w("update", issue_id, "--assignee", "B")
+        code, out, _ = self.cli("ready", "--claim", "--json", "--actor", "A")
+        self.assertEqual((code, json.loads(out)), (1, []))
+
+    def test_issue_prefixes_from_the_environment_apply_to_writes(self):
+        os.environ["CAIRN_ISSUE_PREFIXES"] = "other"
+        self.addCleanup(os.environ.pop, "CAIRN_ISSUE_PREFIXES", None)
+        self.w("remember", "--key", "mem-one", "see [[other-abc]]")
+        conn = open_db(db_path(self.store_dir))
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("SELECT target_kind FROM memory_edges").fetchone()[0], "issue")
+
+    def test_json_on_every_write(self):
+        a, b = self.new("a"), self.new("b")
+        for argv in (["dep", "add", a, b], ["dep", "rm", a, b],
+                     ["remember", "--key", "mem-one", "v"], ["forget", "mem-one"],
+                     ["delete", b, "--force"]):
+            code, out, err = self.cli("--json", *argv, "--actor", "x")
+            self.assertEqual(code, 0, f"{argv}: {err}")
+            json.loads(out)

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import PROG, __version__, prime, shadow, timeutil
-from .importer import SourceError, build_store
+from .importer import ENV_PREFIXES, SourceError, build_store
 from .queries import LINKED_OMITS, Snapshot, check, memories, recall, stats
 from .store import (GITIGNORE, STORE_DIRNAME, StoreError, db_path, find_store_dir,
                     init_store, load_config, open_db, open_writable)
@@ -31,8 +31,6 @@ from .writer import WriteConflict, WriteRefused, Writer
 GLYPH = {"open": "○", "in_progress": "◐", "blocked": "●", "closed": "✓", "deferred": "❄"}
 LEGEND = "Status: ○ open  ◐ in_progress  ● blocked  ✓ closed  ❄ deferred"
 RULE = "-" * 80
-WRITE_VERBS = ("create", "update", "close", "reopen", "delete", "dep", "remember",
-               "forget", "comment", "comments", "note", "defer", "undefer", "init")
 # bd verbs cairn does not implement; refused, never mistaken for something else.
 UNSUPPORTED_VERBS = ("claim", "supersede", "duplicate", "edit")
 PREVIEW = 120
@@ -144,9 +142,15 @@ def cmd_ready(args, start: Path) -> int:
         # bd's `ready --claim` claims the first ready issue: a write behind a read
         # verb, under the same compare-and-swap as `update --claim`.
         writer = open_writer(args, start, claim=True)
-        claimed = writer.claim_ready()
+        claimed = writer.claim_ready(
+            include_deferred=args.include_deferred, priority=parse_priority(args.priority),
+            issue_type=args.type, parent=args.parent, assignee=args.assignee,
+            unassigned=args.unassigned)
         if claimed is None:
-            print("No ready issue to claim.")
+            if args.json:
+                emit_json([])
+            else:
+                print("No ready issue to claim.", file=sys.stderr)
             return 1
         return report_issues(args, writer, [claimed], "Claimed")
     snap = Snapshot(connect(start))
@@ -473,9 +477,10 @@ def open_writer(args, start: Path, *, claim: bool = False) -> Writer:
     store = store_dir_or_fail(start)
     conn = open_writable(db_path(store))
     _OPEN.append(conn)
+    prefixes = [*load_config(store).get("issue_prefixes", []),
+                *(p.strip() for p in os.environ.get(ENV_PREFIXES, "").split(",") if p.strip())]
     return Writer(conn, actor=resolve_actor(args, start, claim=claim),
-                  owner=git_config("user.email", start),
-                  issue_prefixes=load_config(store).get("issue_prefixes", []))
+                  owner=git_config("user.email", start), issue_prefixes=prefixes)
 
 
 def report_issues(args, writer: Writer, ids: Sequence[str], verb: str, extra: str = "") -> int:
@@ -533,9 +538,7 @@ def cmd_create(args, start: Path) -> int:
         acceptance=args.acceptance, notes=args.notes,
         priority=2 if args.priority is None else parse_priority(args.priority),
         issue_type=args.type or "task", parent=args.parent, issue_id=args.id,
-        labels=labels_arg(args.labels), assignee=args.assignee)
-    if args.defer:
-        writer.defer(new_id, args.defer)
+        labels=labels_arg(args.labels), assignee=args.assignee, defer=args.defer)
     if args.silent:
         print(new_id)
         return 0
@@ -556,18 +559,18 @@ def cmd_update(args, start: Path) -> int:
                       priority=None if args.priority is None else parse_priority(args.priority),
                       issue_type=args.type, status=args.status, assignee=args.assignee,
                       add_labels=labels_arg(args.add_label),
-                      remove_labels=labels_arg(args.remove_label))
-        if args.defer:
-            writer.defer(issue_id, args.defer)
+                      remove_labels=labels_arg(args.remove_label), defer=args.defer)
     return report_issues(args, writer, args.ids, "Updated issue:")
 
 
 def cmd_close(args, start: Path) -> int:
     writer = open_writer(args, start)
     before = set(Snapshot(writer.conn).ready(now=timeutil.now_iso())) if args.suggest_next else set()
+    closed = [i for i in args.ids if writer.close(i, args.reason, force=args.force)]
     for issue_id in args.ids:
-        writer.close(issue_id, args.reason)
-    code = report_issues(args, writer, args.ids, "Closed", f": {args.reason or 'Closed'}")
+        if issue_id not in closed and not args.json:
+            print(f"{issue_id} was already closed; unchanged")
+    code = report_issues(args, writer, closed, "Closed", f": {args.reason or 'Closed'}")
     if args.suggest_next and not args.json:
         snap = Snapshot(writer.conn)
         newly = [i for i in snap.ready(now=timeutil.now_iso()) if i not in before]
@@ -642,9 +645,14 @@ def cmd_delete(args, start: Path) -> int:
     if not args.force:
         raise Refused(f"delete is permanent; repeat with --force to delete {', '.join(args.ids)}")
     writer = open_writer(args, start)
+    out = []
     for issue_id in args.ids:
         edges = writer.delete(issue_id)
-        print(f"✓ Deleted {issue_id} (removed {edges} dependency link(s))")
+        out.append({"id": issue_id, "deleted": True, "dependencies_removed": edges})
+        if not args.json:
+            print(f"✓ Deleted {issue_id} (removed {edges} dependency link(s))")
+    if args.json:
+        emit_json(out)
     return 0
 
 
@@ -652,25 +660,39 @@ def cmd_dep(args, start: Path) -> int:
     writer = open_writer(args, start)
     if args.action == "add":
         added = writer.dep_add(args.issue, args.depends_on, args.type)
-        print(f"✓ Added dependency: {args.issue} depends on {args.depends_on} ({args.type})"
-              if added else f"{args.issue} already depends on {args.depends_on} ({args.type})")
+        result = {"issue_id": args.issue, "depends_on_id": args.depends_on, "type": args.type,
+                  "status": "added" if added else "exists"}
+        text = (f"✓ Added dependency: {args.issue} depends on {args.depends_on} ({args.type})"
+                if added else f"{args.issue} already depends on {args.depends_on} ({args.type})")
     else:
-        writer.dep_remove(args.issue, args.depends_on)
-        print(f"✓ Removed dependency: {args.issue} no longer depends on {args.depends_on}")
+        removed = writer.dep_remove(args.issue, args.depends_on)
+        result = {"issue_id": args.issue, "depends_on_id": args.depends_on,
+                  "status": "removed", "removed": removed}
+        text = f"✓ Removed dependency: {args.issue} no longer depends on {args.depends_on}"
+    if args.json:
+        emit_json(result)
+    elif not args.quiet:
+        print(text)
     return 0
 
 
 def cmd_remember(args, start: Path) -> int:
     writer = open_writer(args, start)
     new = writer.remember(args.key or "", args.value)
-    print(f"{'Remembered' if new else 'Updated'} [{args.key}]: {args.value[:PREVIEW]}")
+    if args.json:
+        emit_json({"key": args.key, "status": "created" if new else "updated"})
+    elif not args.quiet:
+        print(f"{'Remembered' if new else 'Updated'} [{args.key}]: {args.value[:PREVIEW]}")
     return 0
 
 
 def cmd_forget(args, start: Path) -> int:
     writer = open_writer(args, start)
     old = writer.forget(args.key)
-    print(f"Forgot [{args.key}]: {old[:PREVIEW]}")
+    if args.json:
+        emit_json({"key": args.key, "status": "deleted"})
+    elif not args.quiet:
+        print(f"Forgot [{args.key}]: {old[:PREVIEW]}")
     return 0
 
 
@@ -818,6 +840,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = writer_parser("close", "close issues")
     p.add_argument("ids", nargs="+")
     p.add_argument("-r", "--reason")
+    p.add_argument("-f", "--force", action="store_true",
+                   help="close even with open blockers")
     p.add_argument("--suggest-next", action="store_true",
                    help="after closing, list issues this close made ready")
     p.set_defaults(func=cmd_close)

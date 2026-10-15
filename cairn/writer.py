@@ -17,7 +17,11 @@ with these deliberate differences:
     silently REPLACES the issue;
   - `delete` without --force is refused (exit 2); bd prints a preview, exit 0;
   - `delete` does not rewrite mentions of the id in other issues' text; bd does;
-  - `remember` requires a key (the session hooks' admission rule).
+  - `remember` requires a key (the session hooks' admission rule);
+  - closing a closed issue is a no-op, as in bd, but without bd's exit 0 text.
+Measured and matched: a deferred or closed issue is not claimable; `close`
+refuses an issue with an open blocker unless forced; `--defer`/`--until` take
+an ISO date or timestamp, `+Nd`, `+Nw`, `+Nh` or `tomorrow`.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from . import links, timeutil
@@ -56,6 +61,31 @@ class WriteConflict(Exception):
 
 def now_iso() -> str:
     return timeutil.now_iso()
+
+
+RELATIVE_RE = re.compile(r"^\+(\d+)([hdw])$")
+
+
+def parse_when(text: str) -> str:
+    """A defer date as bd 1.1.2 accepts it (measured): an ISO date or timestamp,
+    `+Nh`, `+Nd`, `+Nw`, or `tomorrow` (now + 24 h). Parsed BEFORE a transaction
+    opens, so a bad date never leaves half a write behind."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    value = text.strip().lower()
+    match = RELATIVE_RE.match(value)
+    if match:
+        n, unit = int(match.group(1)), match.group(2)
+        when = now + {"h": timedelta(hours=n), "d": timedelta(days=n),
+                      "w": timedelta(weeks=n)}[unit]
+    elif value == "tomorrow":
+        when = now + timedelta(days=1)
+    else:
+        parsed = timeutil.parse(text)
+        if parsed is None:
+            raise WriteRefused(f"not a date: {text!r} (use YYYY-MM-DD, a timestamp, "
+                               "+Nh, +Nd, +Nw or tomorrow)")
+        when = parsed
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def uuid7() -> str:
@@ -113,15 +143,13 @@ class Writer:
              reason: Optional[str] = None) -> Dict[str, Any]:
         """Apply column changes; one field_change event per column that changed
         (bd's audit vocabulary). updated_at moves only when something changed."""
-        changed = {k: v for k, v in changes.items() if row[k] != v}
+        changed = {k: v for k, v in changes.items() if k != "updated_at" and row[k] != v}
         if not changed:
             return {}
         sets = ", ".join(f"{k} = ?" for k in changed)
         self.conn.execute(f"UPDATE issues SET {sets}, updated_at = ? WHERE id = ?",
                           (*changed.values(), now, row["id"]))
         for col, new in changed.items():
-            if col in ("updated_at", "started_at", "closed_at", "close_reason"):
-                continue
             data = {"field": col, "old_value": row[col], "new_value": new}
             if reason is not None and col == "status":
                 data["reason"] = reason
@@ -174,7 +202,9 @@ class Writer:
                design: Optional[str] = None, acceptance: Optional[str] = None,
                notes: Optional[str] = None, priority: int = 2, issue_type: str = "task",
                parent: Optional[str] = None, issue_id: Optional[str] = None,
-               labels: Sequence[str] = (), assignee: Optional[str] = None) -> str:
+               labels: Sequence[str] = (), assignee: Optional[str] = None,
+               defer: Optional[str] = None) -> str:
+        defer_until = parse_when(defer) if defer else None
         if not title or not title.strip():
             raise WriteRefused("a title is required")
         if not 0 <= priority <= 4:
@@ -211,6 +241,11 @@ class Writer:
                 self._insert_dep(now, new_id, parent, PARENT_TYPE)
             self._event(now, "created", {"title": title, "parent": parent},
                         issue_id=new_id)
+            if defer_until:
+                row = self._issue(new_id)
+                changes = self._status_changes(now, row, "deferred")
+                changes["defer_until"] = defer_until
+                self._set(now, row, changes)
         return new_id
 
     def update(self, issue_id: str, *, claim: bool = False, title: Optional[str] = None,
@@ -219,7 +254,8 @@ class Writer:
                append_notes: Optional[str] = None, priority: Optional[int] = None,
                issue_type: Optional[str] = None, status: Optional[str] = None,
                assignee: Optional[str] = None, add_labels: Sequence[str] = (),
-               remove_labels: Sequence[str] = ()) -> None:
+               remove_labels: Sequence[str] = (), defer: Optional[str] = None) -> None:
+        defer_until = parse_when(defer) if defer else None
         if status is not None:
             self._check_status(status)
         if priority is not None and not 0 <= priority <= 4:
@@ -244,6 +280,11 @@ class Writer:
                 changes["notes"] = f"{base}\n{append_notes}" if base else append_notes
             if status is not None:
                 changes.update(self._status_changes(now, row, status))
+            if defer_until:
+                if status not in (None, "deferred"):
+                    raise WriteRefused("--defer and --status together: pick one")
+                changes.update(self._status_changes(now, row, "deferred"))
+                changes["defer_until"] = defer_until
             self._set(now, row, changes)
             for label in dict.fromkeys(add_labels):
                 if self.conn.execute("INSERT OR IGNORE INTO labels(issue_id, label) VALUES (?, ?)",
@@ -283,29 +324,39 @@ class Writer:
         return changes
 
     def _claim(self, now: str, row: sqlite3.Row) -> None:
-        """Compare-and-swap on the assignee: succeeds when the issue is not closed
-        and unassigned or already this actor's. Never overwrites another actor."""
+        """Compare-and-swap on the assignee: succeeds when the issue is neither
+        closed nor deferred (bd 1.1.2 refuses both) and is unassigned or already
+        this actor's. Never overwrites another actor. Re-claiming one's own
+        in-progress issue changes nothing and writes nothing."""
+        if row["assignee"] == self.actor and row["status"] == "in_progress":
+            return
         cur = self.conn.execute(
             "UPDATE issues SET assignee = ?, status = 'in_progress', "
             "started_at = COALESCE(started_at, ?), updated_at = ? "
-            "WHERE id = ? AND status != 'closed' "
+            "WHERE id = ? AND status NOT IN ('closed', 'deferred') "
             "AND (assignee IS NULL OR assignee = '' OR assignee = ?)",
             (self.actor, now, now, row["id"], self.actor))
         if cur.rowcount != 1:
             fresh = self._issue(row["id"])
-            if fresh["status"] == "closed":
-                raise WriteConflict(f"issue {row['id']} not claimable: status closed")
+            if fresh["status"] in ("closed", "deferred"):
+                raise WriteConflict(f"issue {row['id']} not claimable: status {fresh['status']}")
             raise WriteConflict(f"issue {row['id']} already claimed by {fresh['assignee']}")
+        if not row["started_at"]:
+            self._event(now, "field_change",
+                        {"field": "started_at", "old_value": None, "new_value": now},
+                        issue_id=row["id"])
         for col, new in (("assignee", self.actor), ("status", "in_progress")):
             if row[col] != new:
                 self._event(now, "field_change",
                             {"field": col, "old_value": row[col], "new_value": new},
                             issue_id=row["id"])
 
-    def claim_ready(self, *, now_for_ready: Optional[str] = None) -> Optional[str]:
-        """`ready --claim`: claim the first ready issue, under the same CAS."""
+    def claim_ready(self, **filters: Any) -> Optional[str]:
+        """`ready --claim`: claim the first issue `ready` with the same filters
+        would list, under the same CAS. An issue assigned to someone else is
+        skipped, as bd 1.1.2 does (measured)."""
         with self.transaction() as now:
-            ids = Snapshot(self.conn).ready(now=now_for_ready or now)
+            ids = Snapshot(self.conn).ready(now=now, **filters)
             for issue_id in ids:
                 row = self._issue(issue_id)
                 if row["assignee"] in (None, "", self.actor):
@@ -313,12 +364,28 @@ class Writer:
                     return issue_id
         return None
 
-    def close(self, issue_id: str, reason: Optional[str] = None) -> None:
+    def close(self, issue_id: str, reason: Optional[str] = None, *,
+              force: bool = False) -> bool:
+        """False when the issue was already closed: bd 1.1.2 leaves it untouched
+        (measured), reason and all. An open `blocks` dependency refuses the close
+        unless forced, as in bd."""
         with self.transaction() as now:
             row = self._issue(issue_id)
+            if row["status"] == "closed":
+                return False
+            if not force:
+                open_blockers = [r[0] for r in self.conn.execute(
+                    "SELECT d.depends_on_id FROM dependencies d JOIN issues i "
+                    "ON i.id = d.depends_on_id WHERE d.issue_id = ? AND d.type = 'blocks' "
+                    "AND i.status != 'closed' ORDER BY d.depends_on_id", (issue_id,))]
+                if open_blockers:
+                    raise WriteConflict(
+                        f"cannot close {issue_id}: blocked by open issues "
+                        f"[{', '.join(open_blockers)}] (use --force to override)")
             changes = self._status_changes(now, row, "closed")
             changes["close_reason"] = reason or DEFAULT_CLOSE_REASON
             self._set(now, row, changes, reason=changes["close_reason"])
+        return True
 
     def reopen(self, issue_id: str) -> None:
         with self.transaction() as now:
@@ -326,13 +393,11 @@ class Writer:
             self._set(now, row, self._status_changes(now, row, "open"))
 
     def defer(self, issue_id: str, until: str) -> None:
-        stamp = timeutil.parse(until)
-        if stamp is None:
-            raise WriteRefused(f"--until: not a date or timestamp: {until!r}")
+        defer_until = parse_when(until)
         with self.transaction() as now:
             row = self._issue(issue_id)
             changes = self._status_changes(now, row, "deferred")
-            changes["defer_until"] = stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+            changes["defer_until"] = defer_until
             self._set(now, row, changes)
 
     def undefer(self, issue_id: str) -> None:
@@ -363,13 +428,29 @@ class Writer:
         so it is never issued again. Returns the number of edges removed."""
         with self.transaction() as now:
             row = self._issue(issue_id)
-            edges = self.conn.execute(
-                "DELETE FROM dependencies WHERE issue_id = ? OR depends_on_id = ?",
-                (issue_id, issue_id)).rowcount
+            edges = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM dependencies WHERE issue_id = ? OR depends_on_id = ?",
+                (issue_id, issue_id))]
+            labels = [r[0] for r in self.conn.execute(
+                "SELECT label FROM labels WHERE issue_id = ? ORDER BY label", (issue_id,))]
+            comments = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM comments WHERE issue_id = ? ORDER BY created_at, id", (issue_id,))]
+            self.conn.execute("DELETE FROM dependencies WHERE issue_id = ? OR depends_on_id = ?",
+                              (issue_id, issue_id))
+            # Each surviving issue that lost an edge gets its own history row.
+            for edge in edges:
+                if edge["issue_id"] != issue_id:
+                    self._event(now, "dependency_removed",
+                                {"depends_on_id": issue_id, "type": edge["type"],
+                                 "reason": "target deleted"}, issue_id=edge["issue_id"])
+                    self.conn.execute("UPDATE issues SET updated_at = ? WHERE id = ?",
+                                      (now, edge["issue_id"]))
             self.conn.execute("DELETE FROM issues WHERE id = ?", (issue_id,))
-            self._event(now, "deleted", {"title": row["title"], "edges_removed": edges},
+            # The deleted issue's whole record, so the history can say what was lost.
+            self._event(now, "deleted", {"issue": dict(row), "labels": labels,
+                                         "comments": comments, "dependencies": edges},
                         issue_id=issue_id)
-        return edges
+        return len(edges)
 
     # -- dependencies -------------------------------------------------------
 
