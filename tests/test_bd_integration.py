@@ -24,6 +24,8 @@ from cairn import shadow
 from cairn.queries import Snapshot
 from cairn.store import STORE_DIRNAME, db_path, open_db
 
+from .bdversion import CREATE_ID_REFUSED, STRICT_CLOSE, unexplained
+
 ENABLED = os.environ.get("CAIRN_TEST_WITH_BD") == "1" and shutil.which("bd") is not None
 
 
@@ -111,7 +113,7 @@ class RealBdTest(ThrowawayBdStore):
         cp = new("parent deferred to the future, then closed")
         new("child of a closed parent that keeps a future defer date", "--parent", cp)
         bd("defer", cp, "--until=+30d")
-        bd("close", cp)
+        bd("close", cp, *(["--force"] if STRICT_CLOSE else []))
 
         j = new("origin of a discovery")
         new("discovered from another issue", "--deps", f"discovered-from:{j}")
@@ -127,7 +129,7 @@ class RealBdTest(ThrowawayBdStore):
     def test_cairn_agrees_with_bd_on_every_measured_edge_case(self):
         store = self.workspace / STORE_DIRNAME
         result = shadow.run(store, self.workspace, "bd", deadline_seconds=120)
-        self.assertEqual(result.differences, [])
+        self.assertEqual(unexplained(result.differences), [])
         self.assertEqual(result.report.losses, [])
 
         conn = open_db(db_path(store))
@@ -148,8 +150,9 @@ class RealBdTest(ThrowawayBdStore):
         deadline = shadow.Deadline(300)
         for offset in range(0, len(snap.issues), shadow.SHOW_SAMPLE):
             self.assertEqual(
-                shadow.diff(store, self.workspace, "bd", deadline=deadline,
-                            sample_offset=offset), [], f"show sample at offset {offset}")
+                unexplained(shadow.diff(store, self.workspace, "bd", deadline=deadline,
+                                        sample_offset=offset)),
+                [], f"show sample at offset {offset}")
 
 
 @unittest.skipUnless(ENABLED, "set CAIRN_TEST_WITH_BD=1 with bd on PATH to run")
@@ -212,15 +215,22 @@ class IdAllocationTest(ThrowawayBdStore):
         new("first holder", "--id", "t-dup1", "--description", "original body", "-p", "1")
         bd("close", "t-dup1")
         before = len(self.exported_ids())
-        self.assertEqual(new("second holder", "--id", "t-dup1"), "t-dup1")
-        self.assertEqual(len(self.exported_ids()), before)
-        holder = self.show("t-dup1")
-        self.assertEqual(holder["title"], "second holder")
-        self.assertFalse(holder.get("description"))
-        self.assertEqual((holder["status"], holder["priority"]), ("open", 2))
+        if CREATE_ID_REFUSED:       # bd >= 1.3: refused, the holder untouched
+            code, err = self.bd_status("create", "--silent", "--title", "second holder",
+                                       "--id", "t-dup1")
+            self.assertNotEqual(code, 0)
+            self.assertIn("already exists", err)
+            self.assertEqual(self.show("t-dup1")["title"], "first holder")
+        else:
+            self.assertEqual(new("second holder", "--id", "t-dup1"), "t-dup1")
+            self.assertEqual(len(self.exported_ids()), before)
+            holder = self.show("t-dup1")
+            self.assertEqual(holder["title"], "second holder")
+            self.assertFalse(holder.get("description"))
+            self.assertEqual((holder["status"], holder["priority"]), ("open", 2))
 
         # cairn reads the result the way bd does, child-shaped orphan included.
         result = shadow.run(self.workspace / STORE_DIRNAME, self.workspace, "bd",
                             deadline_seconds=120)
-        self.assertEqual(result.differences, [])
+        self.assertEqual(unexplained(result.differences), [])
         self.assertEqual(result.report.losses, [])

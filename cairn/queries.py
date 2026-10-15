@@ -74,6 +74,25 @@ def bd_dependency_id(issue_id: str, target: str) -> str:
     return str(uuid.uuid5(BD_DEPID_NAMESPACE, issue_id + "\x1f" + target))
 
 
+# Dependency order inside an exported issue, by name; meta `dep_order` picks one.
+DEP_ORDERS = {
+    "edge-id": bd_dependency_id,                       # bd 1.1.x
+    "target": lambda issue_id, target: target,         # bd 1.3.x
+}
+DEFAULT_DEP_ORDER = "edge-id"
+
+
+def export_lines(conn: sqlite3.Connection, include_memories: bool) -> List[str]:
+    """The export, one JSON line per row: issues, then memories."""
+    snap = Snapshot(conn)
+    lines = [go_json(snap.issue_object(row["id"], shape="export"))
+             for row in sorted(snap.issues.values(), key=export_order)]
+    if include_memories:
+        lines += [go_json({"_type": "memory", "key": r["key"], "value": r["value"]})
+                  for r in memories(conn)]
+    return lines
+
+
 def export_order(row: Any) -> Any:
     """bd's export row order: priority, newest first, then id (measured on bd
     1.1.2: ORDER BY priority, created_at DESC over an id-ordered scan; created_at
@@ -103,9 +122,17 @@ class Snapshot:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.issues: Dict[str, sqlite3.Row] = {
             row["id"]: row for row in conn.execute("SELECT * FROM issues")}
+        meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
+        # The order bd lists an issue's dependencies in changed between bd versions
+        # (1.1.2: by edge id; 1.3.1: by target id). An import records the source's.
+        dep_key = DEP_ORDERS.get(meta.get("dep_order") or DEFAULT_DEP_ORDER,
+                                 DEP_ORDERS[DEFAULT_DEP_ORDER])
         self.deps: List[sqlite3.Row] = sorted(
             conn.execute("SELECT * FROM dependencies"),
-            key=lambda d: (d["issue_id"], bd_dependency_id(d["issue_id"], d["depends_on_id"])))
+            key=lambda d: (d["issue_id"], dep_key(d["issue_id"], d["depends_on_id"])))
+        learned = meta.get("export_key_order")
+        self.export_key_order: Sequence[str] = (
+            json.loads(learned) if learned else EXPORT_KEY_ORDER)
         self.labels: Dict[str, List[str]] = {}
         for row in conn.execute("SELECT issue_id, label FROM labels ORDER BY issue_id, label"):
             self.labels.setdefault(row["issue_id"], []).append(row["label"])
@@ -296,7 +323,7 @@ class Snapshot:
         obj["dependent_count"] = sum(1 for d in self.dependents_of.get(issue_id, [])
                                      if counted(d))
         obj["comment_count"] = len(comments)
-        order = EXPORT_KEY_ORDER if shape == "export" else ISSUE_KEY_ORDER
+        order = self.export_key_order if shape == "export" else ISSUE_KEY_ORDER
         rank = {name: i for i, name in enumerate(order)}
         return dict(sorted(obj.items(), key=lambda kv: (rank.get(kv[0], len(rank)), kv[0])))
 

@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 ENABLED = os.environ.get("CAIRN_TEST_WITH_BD") == "1" and shutil.which("bd") is not None
+from .bdversion import CREATE_ID_REFUSED, STRICT_TAKEOVER, TARGET_DEP_ORDER  # noqa: E402
+from cairn.importer import export_content  # noqa: E402
 REPO = Path(__file__).resolve().parents[1]
 # Compared per issue. Timestamps are compared as present/absent: the two stores
 # write a second or two apart.
@@ -131,7 +133,12 @@ class DrillTest(unittest.TestCase):
         self.assertEqual([r[0] for r in results], [1, 1])
         for r in results:
             self.assertIn("already claimed by A", r[2])
-        self.same_exit("update", "Child", "--assignee", "B", actor="B")
+        # takeover: bd >= 1.3 wants --force over a live claim; cairn keeps 1.1's rule
+        for s, (code, _, err) in zip(self.sides, (
+                s.run("update", s.ids["Child"], "--assignee", "B",
+                      *(["--force"] if STRICT_TAKEOVER and s.kind == "bd" else []), actor="B")
+                for s in self.sides)):
+            self.assertEqual(code, 0, f"{s.kind} takeover: {err}")
         self.same_exit("update", "Child", "--claim", actor="B")
 
         # a blocker hides the issue from ready; closing it brings it back
@@ -150,9 +157,10 @@ class DrillTest(unittest.TestCase):
         self.same_exit("update", "Root", "--append-notes", "N2", "--add-label", "z")
         self.same_exit("note", "Root", "N3")
         self.same_exit("comment", "Root", "a comment")
-        self.same_exit("close", "Child")
-        self.same_exit("reopen", "Child")
-        self.same_exit("close", "Child", "--reason", "done it")
+        # by the holder: bd >= 1.3 refuses a close by anyone else (cairn: 1.1's rule)
+        self.same_exit("close", "Child", actor="B")
+        self.same_exit("reopen", "Child", actor="B")
+        self.same_exit("close", "Child", "--reason", "done it", actor="B")
         self.same_exit("defer", "Spare", "--until", "2099-01-01")
         self.same_exit("undefer", "Spare")
         self.same_exit("defer", "Spare", "--until", "2099-06-01")
@@ -178,7 +186,10 @@ class DrillTest(unittest.TestCase):
             for s in self.sides:
                 code, _, err = s.run(*[s.ids.get(a, a) for a in argv])
                 if s.kind == "bd":
-                    self.assertEqual(code, 0, f"bd {argv}: {err}")
+                    if argv[0] == "create" and CREATE_ID_REFUSED:
+                        self.assertNotEqual(code, 0, f"bd {argv}: now refused")
+                    else:
+                        self.assertEqual(code, 0, f"bd {argv}: {err}")
                 else:
                     self.assertEqual(code, 2, f"cairn {argv}: {err}")
         after = cairn.state()
@@ -186,8 +197,11 @@ class DrillTest(unittest.TestCase):
                          "a refused write changed cairn's state")
         bd_after = bd.state()
         self.assertEqual(bd_after["issues"]["Root"]["status"], "blocked")
-        self.assertNotIn("Blocker", bd_after["issues"])       # replaced by 'replacement'
-        self.assertIn("replacement", bd_after["issues"])
+        if CREATE_ID_REFUSED:
+            self.assertIn("Blocker", bd_after["issues"])
+        else:
+            self.assertNotIn("Blocker", bd_after["issues"])   # replaced by 'replacement'
+            self.assertIn("replacement", bd_after["issues"])
 
 
 @unittest.skipUnless(ENABLED, "set CAIRN_TEST_WITH_BD=1 with bd on PATH")
@@ -224,12 +238,27 @@ class RoundTripTest(unittest.TestCase):
         self.bd.run("import", str(export), actor=None, check=True)
         _, out, _ = self.bd.run("export", "--all", actor=None, check=True)
 
-        def rows(text: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
-            parsed = [json.loads(line) for line in text.splitlines() if line.strip()]
-            return {(r.get("_type", "issue"), r.get("id") or r.get("key")): r for r in parsed}
-        self.assertEqual(rows(out), rows(export.read_text(encoding="utf-8")))
-        # and byte for byte: row order, key order, dependency order, escaping
-        self.assertEqual(out, export.read_text(encoding="utf-8"))
+        # equal content (dependency order is bd-version specific, see below)
+        self.assertEqual(export_content([json.loads(l) for l in out.splitlines() if l.strip()]),
+                         export_content([json.loads(l) for l in
+                                   export.read_text(encoding="utf-8").splitlines() if l.strip()]))
+        # and byte for byte: row order, key order, dependency order, escaping --
+        # except that bd >= 1.3 lists dependencies by target id, and a store cairn
+        # made without a bd source keeps bd 1.1's order. Importing bd's re-export
+        # (what a migration from that bd does) learns its order and matches it.
+        if not TARGET_DEP_ORDER:
+            self.assertEqual(out, export.read_text(encoding="utf-8"))
+        again = self.base / "again"
+        again.mkdir()
+        reexport = self.base / "bd-reexport.jsonl"
+        reexport.write_text(out, encoding="utf-8")
+        env = {**os.environ, "PYTHONPATH": str(REPO)}
+        sh(again, "git", "init", "-q", ".")
+        proc = subprocess.run([sys.executable, "-m", "cairn", "init", "-p", "t", "--from",
+                               str(reexport), "--json"], cwd=again, env=env,
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIs(json.loads(proc.stdout)["byte_identical"], True)
 
         # The hazard: bd hands out the deleted child's number again; cairn does not.
         _, nxt, _ = self.bd.run("create", "--silent", "--title", "after", "--parent", root,

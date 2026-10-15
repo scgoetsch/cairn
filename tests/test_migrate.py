@@ -114,6 +114,36 @@ class CutoverTest(StoreCase):
                 self.assertEqual(code, 2, f"{name}: {err}")
                 self.assertFalse(db_path(self.store_dir).exists(), name)
 
+    def test_content_the_store_cannot_hold_is_refused(self):
+        # A newer bd adding a field to comments or dependencies: the importer has
+        # no column for it, so the migration must refuse rather than drop it.
+        future = [
+            {**issue("t-c"), "comments": [{"id": "c1", "issue_id": "t-c", "author": "a",
+                                           "text": "x", "created_at": "2026-09-02T00:00:00Z",
+                                           "edited_at": "2026-09-03T00:00:00Z"}]},
+            with_deps(issue("t-d"), {**dep("t-d", "t-c"), "weight": 3}),
+        ]
+        for row in future:
+            with self.subTest(row["id"]):
+                write_jsonl(self.export, [*rows(), row])
+                code, _, err = self.init()
+                self.assertEqual(code, 2, err)
+                self.assertIn("would not hold what the source holds", err)
+                self.assertFalse(db_path(self.store_dir).exists())
+
+    def test_reports_whether_the_layout_matched(self):
+        code, out, err = self.init("--json")
+        self.assertEqual(code, 0, err)
+        # helpers write keys in their own order, not bd's: equal content, other layout
+        self.assertIs(json.loads(out)["byte_identical"], False)
+        export = self.workspace / "again.jsonl"
+        self.cli("export", "--all", "-o", str(export))
+        self.store_dir.rename(self.workspace / "first")
+        code, out, err = self.cli("init", "-p", "t", "--from", str(export), "--json")
+        self.assertEqual(code, 0, err)
+        self.assertIs(json.loads(out)["byte_identical"], True)
+        self.assertEqual(json.loads(out)["bd_version"], None)
+
     def test_prime_says_who_writes(self):
         self.assertEqual(self.init()[0], 0)
         _, out, _ = self.cli("prime")
@@ -140,16 +170,14 @@ class CutoverTest(StoreCase):
 
 class ExportFormatTest(StoreCase):
     """bd's tracked JSONL, reproduced byte for byte (measured on the workspace
-    store, 244 issues, bd 1.1.2): rows by priority, newest first, then id; keys
-    in bd's struct order; dependencies by bd's UUIDv5 edge id; Go's escaping."""
+    store, 244 issues, bd 1.1.2): rows by priority, newest first, then id; Go's
+    escaping. Key order and dependency order are read from the source, because
+    bd changed the dependency order between 1.1.2 and 1.3.1."""
 
-    def test_row_order_key_order_and_escaping(self):
+    def test_row_order_and_escaping(self):
         self.build([
             issue("t-old", created_at="2026-09-01T00:00:00Z", description="a < b && c > d"),
-            issue("t-new", created_at="2026-09-02T00:00:00Z", labels=["x"],
-                  external_ref="ext:1",
-                  comments=[{"id": "c1", "issue_id": "t-new", "author": "a", "text": "hi",
-                             "created_at": "2026-09-02T00:00:00Z"}]),
+            issue("t-new", created_at="2026-09-02T00:00:00Z"),
             issue("t-tie2", created_at="2026-09-02T00:00:00Z"),
             issue("t-tie1", created_at="2026-09-02T00:00:00Z"),
             issue("t-p0", priority=0, created_at="2026-08-01T00:00:00Z"),
@@ -158,28 +186,46 @@ class ExportFormatTest(StoreCase):
         lines = out.splitlines()
         self.assertEqual([json.loads(l)["id"] for l in lines],
                          ["t-p0", "t-new", "t-tie1", "t-tie2", "t-old"])
-        new = json.loads(lines[1])
-        keys = list(new)
-        self.assertLess(keys.index("close_reason") if "close_reason" in keys else 0,
-                        keys.index("external_ref"))
-        self.assertEqual(keys[keys.index("labels"):keys.index("labels") + 2],
-                         ["labels", "comments"])
         self.assertIn("a \\u003c b \\u0026\\u0026 c \\u003e d", lines[-1])
 
-    def test_dependencies_in_bd_edge_id_order(self):
-        # bd's ids for these two edges: ...-sqd sorts before ...-6oa (measured).
-        self.build([
-            with_deps(issue("workspace-3rj"), dep("workspace-3rj", "workspace-6oa"),
-                      dep("workspace-3rj", "workspace-sqd")),
-            issue("workspace-6oa"), issue("workspace-sqd"),
-        ])
+    def test_key_order_follows_the_source_including_unknown_fields(self):
+        row = {"_type": "issue", "id": "t-a", "title": "x", "from_the_future": "kept",
+               "description": "d", "status": "open", "priority": 2, "issue_type": "task",
+               "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"}
+        self.build([row])
         _, out, _ = self.cli("export")
-        row = next(json.loads(l) for l in out.splitlines() if "3rj" in l.split(",")[1])
-        self.assertEqual([d["depends_on_id"] for d in row["dependencies"]],
-                         ["workspace-sqd", "workspace-6oa"])
+        self.assertEqual(list(json.loads(out))[:5],
+                         ["_type", "id", "title", "from_the_future", "description"])
+
+    def test_without_a_source_keys_follow_bd(self):
+        os.environ.pop("BEADS_ACTOR", None)
+        self.assertEqual(self.cli("init", "-p", "t")[0], 0)
+        _, issue_id, _ = self.cli("create", "--silent", "--title", "x", "-l", "a",
+                                  "--actor", "al")
+        self.cli("comment", issue_id.strip(), "hi", "--actor", "al")
+        _, out, _ = self.cli("export")
+        keys = list(json.loads(out))
+        self.assertEqual(keys[keys.index("labels"):keys.index("labels") + 2],
+                         ["labels", "comments"])
+
+    def test_dependency_order_is_read_from_the_source(self):
+        # bd 1.1.2 lists by edge id (sqd's sorts first, measured); bd 1.3.1 by target.
+        for order, profile in ((["workspace-sqd", "workspace-6oa"], "edge-id"),
+                               (["workspace-6oa", "workspace-sqd"], "target")):
+            with self.subTest(profile):
+                self.setUp()
+                self.build([
+                    with_deps(issue("workspace-3rj"),
+                              *(dep("workspace-3rj", t) for t in order)),
+                    issue("workspace-6oa"), issue("workspace-sqd"),
+                ])
+                _, out, _ = self.cli("export")
+                row = next(json.loads(l) for l in out.splitlines()
+                           if json.loads(l)["id"] == "workspace-3rj")
+                self.assertEqual([d["depends_on_id"] for d in row["dependencies"]], order)
 
     def test_go_json(self):
-        self.assertEqual(go_json({"a": "<>&  é"}),
+        self.assertEqual(go_json({"a": "<>&\u2028\u2029é"}),
                          '{"a":"\\u003c\\u003e\\u0026\\u2028\\u2029é"}')
 
 
@@ -255,7 +301,12 @@ assert os.path.isdir(".dolt"), "not run inside a dolt repo"
 open(os.environ["FAKE_DOLT_LOG"], "a").write(os.getcwd() + "\n")
 q = args[-1]
 data = json.loads(os.environ["FAKE_DOLT_DATA"])
-if "dolt_history_issues" in q:
+if q == "SHOW TABLES":
+    rows = [{"Tables_in_x": t} for t in data.get("tables", ["issues", "child_counters",
+                                                              "local_metadata"])]
+elif "local_metadata" in q:
+    rows = [{"value": data["version"]}] if data.get("version") else []
+elif "dolt_history_issues" in q:
     rows = [{"id": i} for i in data["history"]]
 elif "child_counters" in q:
     rows = [{"parent_id": p, "last_child": n} for p, n in data["counters"].items()]
@@ -292,6 +343,20 @@ class DoltSeedTest(unittest.TestCase):
         self.assertEqual(seed["child_counters"], {"t-a": 2})
         ran_in = set(self.log.read_text().split())
         self.assertNotIn(str(self.beads / "embeddeddolt" / "workspace"), ran_in)
+
+    def test_version_and_a_store_without_child_counters(self):
+        self.data(history=["t-a", "t-a.1", "t-a.4", "t-a.4.2"], current=["t-a"],
+                  counters={}, version="9.0.0", tables=["issues", "local_metadata"])
+        seed = doltseed.read_seed(self.beads, str(self.dolt))
+        self.assertEqual(seed["bd_version"], "9.0.0")
+        self.assertEqual(seed["child_counters"], {"t-a": 4, "t-a.4": 2})
+        self.assertIn("derived from the id history", seed["notes"][0])
+
+    def test_server_mode_layout_is_found(self):
+        server = self.beads.parent / "srv" / ".beads" / "dolt" / "proj" / ".dolt"
+        server.mkdir(parents=True)
+        self.assertEqual(doltseed.find_dolt_repo(self.beads.parent / "srv"),
+                         server.parent.resolve())
 
     def test_history_missing_a_current_id_is_an_error(self):
         self.data(history=["t-a"], current=["t-a", "t-b"], counters={})

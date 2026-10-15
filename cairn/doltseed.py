@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -25,8 +26,17 @@ from typing import Any, Dict, List
 QUERIES = {
     "used_ids": "SELECT DISTINCT id FROM dolt_history_issues ORDER BY id",
     "current_ids": "SELECT id FROM issues ORDER BY id",
-    "child_counters": "SELECT parent_id, last_child FROM child_counters ORDER BY parent_id",
 }
+# Read when the table exists (bd 1.1.2 and 1.3.1 have both). Without
+# child_counters the counters are derived from the id history and the seed
+# says so; a counter bd kept beyond the history cannot be recovered then.
+OPTIONAL_QUERIES = {
+    "child_counters": ("child_counters",
+                       "SELECT parent_id, last_child FROM child_counters ORDER BY parent_id"),
+    "bd_version": ("local_metadata",
+                   "SELECT value FROM local_metadata WHERE `key` = 'bd_version'"),
+}
+CHILD = re.compile(r"^(.+)\.(\d+)$")
 
 
 class DoltError(Exception):
@@ -39,7 +49,9 @@ def find_dolt_repo(path: Path) -> Path:
     path = path.resolve()
     if (path / ".dolt").is_dir():
         return path
-    for base in (path, path / "embeddeddolt", path / ".beads" / "embeddeddolt"):
+    # embedded mode keeps .beads/embeddeddolt/<db>; server mode .beads/dolt/<db>
+    for base in (path, path / "embeddeddolt", path / ".beads" / "embeddeddolt",
+                 path / "dolt", path / ".beads" / "dolt"):
         if base.is_dir():
             repos = [p for p in sorted(base.iterdir()) if (p / ".dolt").is_dir()]
             if len(repos) == 1:
@@ -59,7 +71,8 @@ def _query(dolt: str, repo: Path, sql: str, env: Dict[str, str]) -> List[Dict[st
 
 
 def read_seed(source: Path, dolt: str = "dolt") -> Dict[str, Any]:
-    """Return {"source", "used_ids", "child_counters", "deleted_ids"} from a copy
+    """Return {"source", "bd_version", "used_ids", "child_counters", "deleted_ids",
+    "notes"} from a copy
     of the Dolt store at `source`."""
     if shutil.which(dolt) is None:
         raise DoltError(f"dolt CLI not found ({dolt}); bd ships none: install a dolt "
@@ -75,14 +88,33 @@ def read_seed(source: Path, dolt: str = "dolt") -> Dict[str, Any]:
             subprocess.run([dolt, "config", "--global", "--add", key, value], env=env,
                            capture_output=True, check=False)
         rows = {name: _query(dolt, copy, sql, env) for name, sql in QUERIES.items()}
+        tables = {next(iter(r.values())) for r in _query(dolt, copy, "SHOW TABLES", env)}
+        for name, (table, sql) in OPTIONAL_QUERIES.items():
+            rows[name] = _query(dolt, copy, sql, env) if table in tables else None
     used = [r["id"] for r in rows["used_ids"]]
     current = [r["id"] for r in rows["current_ids"]]
     missing = sorted(set(current) - set(used))
     if missing:          # the history table must contain the present
         raise DoltError(f"Dolt history lacks current ids: {', '.join(missing[:5])}")
+    notes: List[str] = []
+    if rows["child_counters"] is None:
+        counters: Dict[str, int] = {}
+        for issue_id in used:
+            match = CHILD.match(issue_id)
+            if match:
+                counters[match.group(1)] = max(counters.get(match.group(1), 0),
+                                               int(match.group(2)))
+        notes.append("no child_counters table: counters derived from the id history")
+    else:
+        counters = {r["parent_id"]: int(r["last_child"]) for r in rows["child_counters"]}
+    version = rows["bd_version"][0]["value"] if rows["bd_version"] else None
+    if version is None:
+        notes.append("bd version not recorded in the store")
     return {
         "source": str(repo),
+        "bd_version": version,
         "used_ids": used,
-        "child_counters": {r["parent_id"]: int(r["last_child"]) for r in rows["child_counters"]},
+        "child_counters": counters,
         "deleted_ids": sorted(set(used) - set(current)),
+        "notes": notes,
     }

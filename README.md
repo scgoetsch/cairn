@@ -103,6 +103,49 @@ repository to a temporary directory and reads, from the copy, every id in the
 history of `issues` and bd's `child_counters`. bd embeds Dolt and ships no CLI;
 any dolt release that reads the store works (measured with 2.4.2 on bd 1.1.2).
 
+### Migrating from other bd versions
+
+A migration does not depend on cairn knowing your bd version. `init --from`
+proves each one: before anything is written it exports the new store and
+compares that with the bd export it read, row by row and field by field
+(dependency and label order aside). Any difference in content (a field cairn
+cannot hold, a row it would drop) refuses the migration and names the
+differences. A difference only in layout is reported, and the tracked export is
+then rewritten once.
+
+The layout is learned from the source, not assumed: the key order (fields a
+newer bd adds included) and the order an issue's dependencies are listed in,
+which bd changed between versions. `seed-from-dolt` records the bd version
+(`local_metadata.bd_version`), reads embedded (`.beads/embeddeddolt/`) and
+server-mode (`.beads/dolt/`) stores, and derives the child counters from the id
+history if a bd has no `child_counters` table (it says so). `init` records the
+version; `--bd-version` names it when there is no seed.
+
+| bd | Migration | Export layout | Measured |
+|---|---|---|---|
+| 1.1.2 | proven on a 244-issue store | byte-identical | 2026-10-15 |
+| 1.3.1 | proven on the same data plus a deleted child | byte-identical | 2026-10-15 |
+
+After the migration cairn's verbs follow bd 1.1.2's rules. bd 1.3.1 tightened
+some of them: closing a parent with an open child, closing an issue assigned to
+someone else, and `--assignee` over another actor's live claim are refused
+without `--force` (cairn allows them), and `create --id` over an existing id
+fails (cairn refuses it too). On reads, 1.3.1's `show` adds a `revision` field
+and `ready` orders differently (not analysed). The real-bd tests encode these
+per version (`tests/bdversion.py`).
+
+To check a bd version nobody has measured, run the real-bd tests with that bd
+first on PATH:
+
+```bash
+CAIRN_TEST_WITH_BD=1 python3 -m unittest tests.test_drill tests.test_bd_integration
+```
+
+A failure there is a behaviour your bd has and 1.1.2 did not. It does not make
+the migration unsafe (the self-check guards that); it tells you where cairn will
+behave differently from the bd you are leaving. Record it in `tests/bdversion.py`
+and in the table above.
+
 `migrate` applies the numbered steps in `store.MIGRATIONS`. It holds the write
 lock, writes `cairn.db.v<N>.bak` first, runs every step in one transaction,
 checks foreign keys before committing, and removes the backup again if a step
@@ -260,12 +303,14 @@ Writes (each pinned in `tests/test_writer.py` or `tests/test_drill.py`):
 
 Reads:
 
-- `export` is byte-identical to bd's: rows by priority, then newest first, then
-  id; keys in the field order of bd's Issue struct; an issue's dependencies in
-  the order of bd's UUIDv5 edge id (bd 1.1.2 `internal/storage/depid`); `<`, `>`,
-  `&`, U+2028 and U+2029 escaped as Go's encoding/json does. Measured on the
-  workspace store (244 issues, 49 memories: `cmp` equal) and pinned against real
-  bd by `RoundTripTest`. Consecutive exports of an unchanged store are equal.
+- `export` is byte-identical to the bd export a store was migrated from: rows by
+  priority, then newest first, then id; keys in the order learned from the
+  source (bd's Issue struct order when there is no source); an issue's
+  dependencies in the source's order (bd 1.1.2: UUIDv5 edge id,
+  `internal/storage/depid`; bd 1.3.1: target id); `<`, `>`, `&`, U+2028 and
+  U+2029 escaped as Go's encoding/json does. Measured on the workspace store
+  (244 issues, 49 memories) from bd 1.1.2 and 1.3.1, and pinned against real bd
+  by `RoundTripTest`. Consecutive exports of an unchanged store are equal.
 - `show --json` adds `dependents` and `comments`; bd's prints neither. Every key
   bd prints is present with the same value.
 - `blocked_by` is sorted; bd's order is unspecified.

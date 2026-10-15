@@ -23,8 +23,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from . import PROG, __version__, doltseed, prime, shadow, timeutil
 from .importer import ENV_PREFIXES, SourceError, build_store, build_writable
-from .queries import (LINKED_OMITS, Snapshot, check, export_order, go_json, memories, recall,
-                      stats)
+from .queries import (LINKED_OMITS, Snapshot, check, export_lines, memories, recall, stats)
 from .store import (GITIGNORE, STORE_DIRNAME, StoreError, db_path, find_store_dir,
                     init_store, load_config, migrate, open_db, open_writable)
 from .writer import WriteConflict, WriteRefused, Writer
@@ -319,13 +318,8 @@ def cmd_prime(args, start: Path) -> int:
 
 def cmd_export(args, start: Path) -> int:
     conn = connect(start)
-    snap = Snapshot(conn)
-    lines = [go_json(snap.issue_object(row["id"], shape="export"))
-             for row in sorted(snap.issues.values(), key=export_order)]
-    issue_count = len(lines)
-    if args.include_memories or args.all:
-        lines += [go_json({"_type": "memory", "key": r["key"], "value": r["value"]})
-                  for r in memories(conn)]
+    lines = export_lines(conn, bool(args.include_memories or args.all))
+    issue_count = sum(1 for line in lines if line.startswith('{"_type":"issue"'))
     text = "".join(line + "\n" for line in lines)
     if not args.output:
         sys.stdout.write(text)
@@ -515,16 +509,28 @@ def cmd_init(args, start: Path) -> int:
         return 0
     report = build_writable(
         db_path(store), Path(args.source), args.prefix,
-        seed_path=Path(args.seed) if args.seed else None,
+        seed_path=Path(args.seed) if args.seed else None, bd_version=args.bd_version,
         interactions_path=Path(args.interactions) if args.interactions else None,
         ledger_path=Path(args.ledger) if args.ledger else None,
         hot_path=Path(args.hot) if args.hot else None,
         extra_prefixes=load_config(store).get("issue_prefixes", []))
+    conn = open_db(db_path(store))
+    try:
+        bd_version = conn.execute("SELECT value FROM meta WHERE key = 'bd_version'").fetchone()
+    finally:
+        conn.close()
+    bd_version = bd_version[0] if bd_version else None
+    layout = ("byte-identical to the source" if report.byte_identical else
+              "equal in content to the source; layout differs (the tracked export will be "
+              "rewritten once)")
     if args.json:
-        emit_json({"store": str(store), "counts": report.counts, "warnings": report.warnings})
+        emit_json({"store": str(store), "counts": report.counts, "warnings": report.warnings,
+                   "byte_identical": report.byte_identical, "bd_version": bd_version})
     elif not args.quiet:
         print(f"Initialised a writable cairn store at {store} (prefix {args.prefix}) from "
               f"{args.source}: " + ", ".join(f"{n} {k}" for k, n in report.counts.items()))
+        print(f"✓ Verified: its export is {layout}. Source bd version: "
+              f"{bd_version or 'unknown (pass --seed or --bd-version)'}")
         for warning in report.warnings:
             print(f"⚠ {warning}")
     return 0
@@ -553,9 +559,11 @@ def cmd_seed_from_dolt(args, start: Path) -> int:
     text = json.dumps(seed, indent=1, sort_keys=True) + "\n"
     if args.output:
         Path(args.output).write_text(text, encoding="utf-8")
-        print(f"Seed written to {args.output}: {len(seed['used_ids'])} ids ever issued "
-              f"({len(seed['deleted_ids'])} deleted), {len(seed['child_counters'])} "
-              "child counters", file=sys.stderr)
+        print(f"Seed written to {args.output}: bd {seed['bd_version'] or 'version unknown'}, "
+              f"{len(seed['used_ids'])} ids ever issued ({len(seed['deleted_ids'])} deleted), "
+              f"{len(seed['child_counters'])} child counters", file=sys.stderr)
+        for note in seed["notes"]:
+            print(f"⚠ {note}", file=sys.stderr)
     else:
         sys.stdout.write(text)
     return 0
@@ -863,6 +871,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--interactions", help="bd interactions.jsonl (becomes the event history)")
     p.add_argument("--ledger", help="bd-memgraph ledger (memory timestamps and deletions)")
     p.add_argument("--hot", help="hot list: one memory key per line")
+    p.add_argument("--bd-version", help="the bd version that wrote EXPORT (default: from "
+                                        "the seed); recorded, not trusted for checks")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("migrate", help="bring a writable store to this build's schema")

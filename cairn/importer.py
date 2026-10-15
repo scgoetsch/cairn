@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 from . import links, timeutil
+from .queries import DEP_ORDERS, EXPORT_KEY_ORDER, export_lines
 from .store import STATUSES, StoreError, create_db, open_writable
 
 ISSUE_COLUMNS = (
@@ -59,6 +60,9 @@ class SourceError(Exception):
 @dataclass
 class ImportReport:
     counts: Dict[str, int] = field(default_factory=dict)
+    # Set by a writable build's self-check: the store's export equals the source
+    # byte for byte (False: equal in content, different in layout).
+    byte_identical: Optional[bool] = None
     warnings: List[str] = field(default_factory=list)
     losses: List[str] = field(default_factory=list)
 
@@ -177,6 +181,103 @@ def _insert_dependencies(conn: sqlite3.Connection, row: Dict[str, Any], where: s
             raise SourceError(f"{spot}: duplicate edge to {target}: {exc}") from exc
         count += 1
     return count
+
+
+def detect_dep_order(rows: Sequence[Mapping[str, Any]]) -> Optional[str]:
+    """The name in queries.DEP_ORDERS that every multi-dependency issue in the
+    source is sorted by. bd changed it between versions, so it is read from the
+    data, not assumed. With no multi-dependency issue every order fits: the
+    first (bd 1.1's) is returned. None when no known order fits."""
+    fits = list(DEP_ORDERS)
+    for row in rows:
+        deps = row.get("dependencies") or []
+        if len(deps) < 2 or not all(isinstance(d, dict) for d in deps):
+            continue
+        pairs = [(str(d.get("issue_id")), str(d.get("depends_on_id"))) for d in deps]
+        fits = [name for name in fits
+                if [DEP_ORDERS[name](*p) for p in pairs]
+                == sorted(DEP_ORDERS[name](*p) for p in pairs)]
+    return fits[0] if fits else None
+
+
+def learn_key_order(rows: Sequence[Mapping[str, Any]]) -> List[str]:
+    """The key order the source writes issues in. Each row shows only its
+    non-empty keys, so each row only says "a comes before b" for neighbours; the
+    order is the topological sort of all those constraints, ties broken by bd's
+    known order (keys it does not know: by first appearance). Keys the source
+    never used are included at their known place. A newer bd's new fields are
+    thereby written back where it writes them."""
+    # Tie-break rank: a known key's place in bd's order; an unknown key ranks
+    # just after the key it first followed, so unconstrained known keys do not
+    # jump ahead of it.
+    rank: Dict[str, Tuple[int, int, int]] = {
+        k: (i, 0, 0) for i, k in enumerate(EXPORT_KEY_ORDER)}
+    after: Dict[str, Set[str]] = {k: set() for k in EXPORT_KEY_ORDER}
+    indegree: Dict[str, int] = {k: 0 for k in EXPORT_KEY_ORDER}
+    seen = 0
+    for row in rows:
+        keys = list(row)
+        for i, key in enumerate(keys):
+            if key not in rank:
+                seen += 1
+                rank[key] = (rank[keys[i - 1]][0] if i else -1, 1, seen)
+                after[key], indegree[key] = set(), 0
+        for a, b in zip(keys, keys[1:]):
+            if b not in after[a]:
+                after[a].add(b)
+                indegree[b] += 1
+    order: List[str] = []
+    ready = sorted((k for k, n in indegree.items() if n == 0), key=rank.__getitem__)
+    while ready:
+        key = ready.pop(0)
+        order.append(key)
+        for nxt in after[key]:
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0:
+                ready.append(nxt)
+        ready.sort(key=rank.__getitem__)
+    # rows that contradict each other leave a cycle: the rest by known order
+    order += sorted((k for k in indegree if k not in order), key=rank.__getitem__)
+    return order
+
+
+def export_content(rows: Sequence[Mapping[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """Rows keyed by (type, id or key), with dependency lists in a fixed order:
+    what must survive a migration, independent of layout."""
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in rows:
+        obj = dict(row)
+        if isinstance(obj.get("dependencies"), list):
+            obj["dependencies"] = sorted(obj["dependencies"],
+                                         key=lambda d: json.dumps(d, sort_keys=True))
+        if isinstance(obj.get("labels"), list):
+            obj["labels"] = sorted(obj["labels"])
+        out[(str(obj.get("_type", "issue")), str(obj.get("id") or obj.get("key")))] = obj
+    return out
+
+
+def verify_round_trip(conn: sqlite3.Connection, export_path: Path) -> bool:
+    """The migration's proof, for any bd version: the new store's export must hold
+    exactly what the source held. A difference in content raises (nothing is
+    written); a difference only in layout returns False."""
+    source_text = export_path.read_text(encoding="utf-8")
+    source = [json.loads(line) for line in source_text.splitlines() if line.strip()]
+    has_memories = any(r.get("_type") == "memory" for r in source)
+    lines = export_lines(conn, has_memories)
+    want, got = export_content(source), export_content([json.loads(line) for line in lines])
+    problems: List[str] = []
+    for key in sorted(set(want) | set(got)):
+        a, b = want.get(key), got.get(key)
+        if a is None or b is None:
+            problems.append(f"{key[0]} {key[1]} only in the {'store' if a is None else 'source'}")
+            continue
+        for name in sorted(set(a) | set(b)):
+            if a.get(name) != b.get(name) and name not in DERIVED_FIELDS:
+                problems.append(f"{key[0]} {key[1]}: '{name}' differs")
+    if problems:
+        raise SourceError(f"the new store would not hold what the source holds "
+                          f"({len(problems)} difference(s)): " + "; ".join(problems[:8]))
+    return "".join(line + "\n" for line in lines) == source_text
 
 
 def _detect_prefix(issue_ids: Set[str]) -> str:
@@ -306,8 +407,15 @@ def import_into(conn: sqlite3.Connection, export_path: Path, *,
                 raise SourceError(f"{where}: {exc}") from exc
             events += 1
 
+    dep_order = detect_dep_order([r for _, r in issue_rows])
+    if dep_order is None:
+        report.warnings.append("dependency order in the source matches no known bd version; "
+                               "the export keeps bd 1.1's order")
+    key_order = learn_key_order([r for _, r in issue_rows])
     for key, value in (("prefix", prefix), ("source", source_label or str(export_path)),
-                       ("imported_at", timeutil.now_iso())):
+                       ("imported_at", timeutil.now_iso()),
+                       ("export_key_order", json.dumps(key_order)),
+                       *((("dep_order", dep_order),) if dep_order else ())):
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, value))
     conn.commit()
 
@@ -369,13 +477,13 @@ def build_store(target: Path, export_path: Path, **sources: Any) -> ImportReport
 CHILD_ID = re.compile(r"^(.+)\.(\d+)$")
 
 
-def load_seed(path: Optional[Path]) -> Tuple[Set[str], Dict[str, int]]:
+def load_seed(path: Optional[Path]) -> Tuple[Set[str], Dict[str, int], Optional[str]]:
     """An allocator seed: {"used_ids": [every id bd ever issued, deleted ones
     included], "child_counters": {parent: last child number bd issued}}. No
     export carries deleted ids, so the seed comes from bd's Dolt history
     (`cairn seed-from-dolt`)."""
     if path is None:
-        return set(), {}
+        return set(), {}, None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -388,7 +496,8 @@ def load_seed(path: Optional[Path]) -> Tuple[Set[str], Dict[str, int]]:
             isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v >= 0
             for k, v in counters.items()):
         raise SourceError(f"{path}: 'child_counters' must map parent ids to numbers >= 0")
-    return set(used), dict(counters)
+    version = data.get("bd_version")
+    return set(used), dict(counters), version if isinstance(version, str) else None
 
 
 def seed_allocator(conn: sqlite3.Connection, prefix: str, used: Set[str],
@@ -420,13 +529,15 @@ def seed_allocator(conn: sqlite3.Connection, prefix: str, used: Set[str],
 
 
 def build_writable(target: Path, export_path: Path, prefix: str, *,
-                   seed_path: Optional[Path] = None, **sources: Any) -> ImportReport:
+                   seed_path: Optional[Path] = None, bd_version: Optional[str] = None,
+                   **sources: Any) -> ImportReport:
     """Create a WRITABLE store at `target` from a bd export: the cutover from bd.
     All or nothing, and only when the copy is faithful: an import with losses,
     or issues under another prefix, is refused and nothing is written."""
     if target.exists():
         raise StoreError(f"{target} already exists")
-    used, counters = load_seed(seed_path)
+    used, counters, seed_version = load_seed(seed_path)
+    bd_version = bd_version or seed_version
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_name(f"{target.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
     conn = None
@@ -443,7 +554,9 @@ def build_writable(target: Path, export_path: Path, prefix: str, *,
         report.counts.update(seed_allocator(conn, prefix, used, counters))
         conn.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
                          (("writable", "1"), ("allocator", "1"), ("prefix", prefix),
-                          ("migrated_from", str(export_path))))
+                          ("migrated_from", str(export_path)),
+                          *((("bd_version", bd_version),) if bd_version else ())))
+        report.byte_identical = verify_round_trip(conn, export_path)
         conn.commit()
         conn.close()
         conn = None
