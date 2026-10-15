@@ -11,6 +11,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 STORE_DIRNAME = ".cairn"
 DB_FILENAME = "cairn.db"
 CONFIG_FILENAME = "config.json"
+REDIRECT_FILENAME = "redirect"
 # The store directory is ignored by git except for these two files: the database
 # and logs are derived, the configuration is not.
 GITIGNORE = "*\n!.gitignore\n!config.json\n"
@@ -167,8 +168,25 @@ def find_store_dir(start: Optional[Path] = None,
     for candidate in (here, *here.parents):
         store = candidate / STORE_DIRNAME
         if store.is_dir():
-            return store
+            return follow_redirect(store)
     return None
+
+
+def follow_redirect(store: Path) -> Path:
+    """A git worktree checks out the tracked part of `.cairn/` but not the database. Its
+    untracked `.cairn/redirect` names the store directory to use instead (one absolute
+    path, as bd's `.beads/redirect` does); one hop, never a chain."""
+    redirect = store / REDIRECT_FILENAME
+    if not redirect.is_file():
+        return store
+    target = Path(redirect.read_text(encoding="utf-8").strip())
+    if not target.is_absolute():
+        raise StoreError(f"{redirect} must hold an absolute path, not {str(target)!r}")
+    if not target.is_dir():
+        raise StoreError(f"{redirect} points at {target}, which is not a directory")
+    if (target / REDIRECT_FILENAME).exists():
+        raise StoreError(f"{redirect} points at another redirect ({target}); one hop only")
+    return target
 
 
 def db_path(store_dir: Path) -> Path:

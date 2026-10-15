@@ -146,6 +146,15 @@ the migration unsafe (the self-check guards that); it tells you where cairn will
 behave differently from the bd you are leaving. Record it in `tests/bdversion.py`
 and in the table above.
 
+### What git must carry, and worktrees
+
+The database is git-ignored. What rebuilds it is the two JSONL exports plus the allocator state:
+`cairn export --allocator -o .beads/allocator.json` writes every id ever issued and each parent's
+last child number, in the seed format, and a fresh checkout rebuilds with
+`cairn init -p P --from <issues + memories> --seed .beads/allocator.json` without reissuing an id
+(`FreshCheckoutTest`). A git worktree checks out `.cairn/config.json` but no database; an untracked
+`.cairn/redirect` holding the absolute path of the main `.cairn/` points every verb there (one hop).
+
 `migrate` applies the numbered steps in `store.MIGRATIONS`. It holds the write
 lock, writes `cairn.db.v<N>.bak` first, runs every step in one transaction,
 checks foreign keys before committing, and removes the backup again if a step

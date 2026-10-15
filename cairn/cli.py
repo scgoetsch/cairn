@@ -316,10 +316,32 @@ def cmd_prime(args, start: Path) -> int:
     return 0
 
 
+def allocator_seed(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """The allocator state in the seed format `init --seed` reads: every id ever issued and,
+    per parent, the last child number issued. It is what no JSONL export carries; tracked
+    beside the exports, it lets a fresh checkout rebuild the store without reissuing an id."""
+    used = [r[0] for r in conn.execute("SELECT id FROM used_ids ORDER BY id")]
+    counters = {r[0]: r[1] - 1 for r in conn.execute(
+        "SELECT parent_id, next_n FROM id_counters ORDER BY parent_id")}
+    meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM meta")}
+    return {"used_ids": used, "child_counters": counters,
+            "bd_version": meta.get("bd_version"), "source": "cairn export --allocator"}
+
+
 def cmd_export(args, start: Path) -> int:
     conn = connect(start)
-    lines = export_lines(conn, bool(args.include_memories or args.all))
-    issue_count = sum(1 for line in lines if line.startswith('{"_type":"issue"'))
+    if args.allocator:
+        if args.include_memories or args.all:
+            raise Refused("--allocator writes the allocator state alone")
+        if conn.execute("SELECT value FROM meta WHERE key = 'writable'").fetchone() is None:
+            raise Refused("a shadow has no allocator state (bd allocates); --allocator needs "
+                          "a writable store")
+        seed = allocator_seed(conn)
+        lines = [json.dumps(seed, indent=1, sort_keys=True)]
+        issue_count = 0
+    else:
+        lines = export_lines(conn, bool(args.include_memories or args.all))
+        issue_count = sum(1 for line in lines if line.startswith('{"_type":"issue"'))
     text = "".join(line + "\n" for line in lines)
     if not args.output:
         sys.stdout.write(text)
@@ -332,7 +354,8 @@ def cmd_export(args, start: Path) -> int:
     finally:
         if temp.exists():
             temp.unlink()
-    print(f"Exported {issue_count} issues to {args.output}")
+    print(f"Exported the allocator state to {args.output}" if args.allocator
+          else f"Exported {issue_count} issues to {args.output}")
     return 0
 
 
@@ -830,6 +853,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output")
     p.add_argument("--include-memories", action="store_true")
     p.add_argument("--all", action="store_true")
+    p.add_argument("--allocator", action="store_true",
+                   help="write the allocator state (ids ever issued, child counters) as a seed "
+                        "for `init --from ... --seed`, instead of rows")
     p.set_defaults(func=cmd_export)
 
     sub.add_parser("check", help="referential integrity of issues and memory links"

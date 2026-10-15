@@ -168,6 +168,79 @@ class CutoverTest(StoreCase):
         self.assertIn("already exists", err)
 
 
+class FreshCheckoutTest(StoreCase):
+    """What git carries (the two JSONL exports and the allocator state) rebuilds a store that
+    reissues nothing: the 'fresh checkout' clause of stage 4."""
+
+    def test_rebuild_from_tracked_files_burns_deleted_ids(self):
+        os.environ.pop("BEADS_ACTOR", None)
+        live = self.workspace / "live"
+        live.mkdir()
+        self.assertEqual(self.cli("init", "-p", "t", cwd=live)[0], 0)
+        w = lambda *a: self.cli(*a, "--actor", "al", cwd=live)[1].strip()  # noqa: E731
+        root = w("create", "--silent", "--title", "root")
+        kids = [w("create", "--silent", "--title", f"k{i}", "--parent", root) for i in range(3)]
+        gone = w("create", "--silent", "--title", "gone")
+        self.cli("delete", kids[2], "--force", "--actor", "al", cwd=live)
+        self.cli("delete", gone, "--force", "--actor", "al", cwd=live)
+        self.cli("remember", "--key", "m", "body", "--actor", "al", cwd=live)
+        issues, mems, alloc = (self.workspace / n for n in ("issues.jsonl", "memories.jsonl",
+                                                            "allocator.json"))
+        _, out, _ = self.cli("export", "--all", cwd=live)
+        issues.write_text("".join(l + "\n" for l in out.splitlines() if '"_type":"issue"' in l))
+        mems.write_text("".join(l + "\n" for l in out.splitlines() if '"_type":"memory"' in l))
+        self.assertEqual(self.cli("export", "--allocator", "-o", str(alloc), cwd=live)[0], 0)
+        seed = json.loads(alloc.read_text())
+        self.assertIn(gone, seed["used_ids"])
+        self.assertEqual(seed["child_counters"][root], 3)
+
+        fresh = self.workspace / "fresh"
+        fresh.mkdir()
+        both = self.workspace / "both.jsonl"
+        both.write_text(issues.read_text() + mems.read_text())
+        code, _, err = self.cli("init", "-p", "t", "--from", str(both), "--seed", str(alloc),
+                                cwd=fresh)
+        self.assertEqual(code, 0, err)
+        f = lambda *a: self.cli(*a, "--actor", "al", cwd=fresh)  # noqa: E731
+        self.assertEqual(f("create", "--silent", "--title", "n", "--parent", root)[1].strip(),
+                         f"{root}.4")
+        code, _, err = f("create", "--id", gone, "--title", "again")
+        self.assertEqual(code, 2)
+        self.assertIn("existed", err)
+        self.assertIn("body", self.cli("recall", "m", cwd=fresh)[1])
+
+    def test_allocator_export_refuses_a_shadow(self):
+        self.build([issue("t-a")])
+        code, _, err = self.cli("export", "--allocator")
+        self.assertEqual(code, 2)
+        self.assertIn("shadow", err)
+
+
+class WorktreeRedirectTest(StoreCase):
+    def test_a_redirect_names_the_main_store(self):
+        os.environ.pop("BEADS_ACTOR", None)
+        self.assertEqual(self.cli("init", "-p", "t")[0], 0)
+        tree = self.workspace / "wt"
+        (tree / ".cairn").mkdir(parents=True)
+        (tree / ".cairn" / "config.json").write_text("{}")
+        (tree / ".cairn" / "redirect").write_text(str(self.store_dir.resolve()) + "\n")
+        _, out, _ = self.cli("create", "--silent", "--title", "from the worktree",
+                             "--actor", "al", cwd=tree)
+        _, listing, _ = self.cli("list", "--json")
+        self.assertIn(out.strip(), [i["id"] for i in json.loads(listing)])
+        self.assertFalse((tree / ".cairn" / "cairn.db").exists())
+
+    def test_bad_redirects_are_errors(self):
+        tree = self.workspace / "wt"
+        (tree / ".cairn").mkdir(parents=True)
+        for text, needle in (("relative/path", "absolute"),
+                             (str(self.workspace / "nowhere"), "not a directory")):
+            (tree / ".cairn" / "redirect").write_text(text)
+            code, _, err = self.cli("list", cwd=tree)
+            self.assertEqual(code, 2)
+            self.assertIn(needle, err)
+
+
 class ExportFormatTest(StoreCase):
     """bd's tracked JSONL, reproduced byte for byte (measured on the workspace
     store, 244 issues, bd 1.1.2): rows by priority, newest first, then id; Go's
