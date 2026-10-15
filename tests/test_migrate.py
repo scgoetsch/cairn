@@ -114,6 +114,20 @@ class CutoverTest(StoreCase):
                 self.assertEqual(code, 2, f"{name}: {err}")
                 self.assertFalse(db_path(self.store_dir).exists(), name)
 
+    def test_prime_says_who_writes(self):
+        self.assertEqual(self.init()[0], 0)
+        _, out, _ = self.cli("prime")
+        self.assertIn("cairn is its only writer", out)
+        self.assertNotIn("Shadow mode", out)
+
+    def test_init_honours_cairn_dir(self):
+        target = self.workspace / "elsewhere"
+        os.environ["CAIRN_DIR"] = str(target)
+        self.addCleanup(os.environ.pop, "CAIRN_DIR", None)
+        self.assertEqual(self.init()[0], 0)
+        self.assertTrue(db_path(target).is_file())
+        self.assertFalse(db_path(self.store_dir).exists())
+
     def test_existing_store_and_stray_options_are_refused(self):
         code, _, err = self.cli("init", "-p", "t", "--seed", str(self.export))
         self.assertEqual(code, 2)

@@ -497,7 +497,8 @@ def report_issues(args, writer: Writer, ids: Sequence[str], verb: str, extra: st
 
 
 def cmd_init(args, start: Path) -> int:
-    store = start / STORE_DIRNAME
+    # CAIRN_DIR names the store directory for every verb, init included.
+    store = Path(os.environ["CAIRN_DIR"]) if os.environ.get("CAIRN_DIR") else start / STORE_DIRNAME
     if db_path(store).exists():
         raise Refused(f"{db_path(store)} already exists")
     sources = (args.seed, args.interactions, args.ledger, args.hot)

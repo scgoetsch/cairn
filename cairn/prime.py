@@ -54,8 +54,11 @@ def build(conn: sqlite3.Connection, *, now: str, budget: int = DEFAULT_BUDGET) -
     head = [
         f"# {PROG.capitalize()} Workflow Context",
         "",
-        f"> Store imported {get_meta(conn, 'imported_at')} from {get_meta(conn, 'source')}. "
-        "Shadow mode: bd is the only writer.",
+        (f"> Writable store ({get_meta(conn, 'prefix')}): {PROG} is its only writer. "
+         f"Write with `{PROG}`, never `bd`."
+         if get_meta(conn, "writable") == "1" else
+         f"> Store imported {get_meta(conn, 'imported_at')} from {get_meta(conn, 'source')}. "
+         "Shadow mode: bd is the only writer."),
         "",
     ]
     head += _work_section(snap, now)
