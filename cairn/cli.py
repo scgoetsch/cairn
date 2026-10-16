@@ -23,7 +23,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from . import PROG, __version__, doltseed, prime, shadow, timeutil
 from .importer import ENV_PREFIXES, SourceError, build_store, build_writable
-from .queries import (LINKED_OMITS, Snapshot, check, export_lines, memories, recall, stats)
+from .queries import (LINKED_OMITS, Snapshot, check, events_lines, export_lines, memories,
+                      recall, stats)
 from .store import (GITIGNORE, STORE_DIRNAME, StoreError, db_path, find_store_dir,
                     init_store, load_config, migrate, open_db, open_writable)
 from .writer import WriteConflict, WriteRefused, Writer
@@ -330,7 +331,12 @@ def allocator_seed(conn: sqlite3.Connection) -> Dict[str, Any]:
 
 def cmd_export(args, start: Path) -> int:
     conn = connect(start)
-    if args.allocator:
+    if args.events:
+        if args.include_memories or args.all or args.allocator:
+            raise Refused("--events writes the event history alone")
+        lines = events_lines(conn)
+        issue_count = 0
+    elif args.allocator:
         if args.include_memories or args.all:
             raise Refused("--allocator writes the allocator state alone")
         if conn.execute("SELECT value FROM meta WHERE key = 'writable'").fetchone() is None:
@@ -354,7 +360,8 @@ def cmd_export(args, start: Path) -> int:
     finally:
         if temp.exists():
             temp.unlink()
-    print(f"Exported the allocator state to {args.output}" if args.allocator
+    print(f"Exported {len(lines)} events to {args.output}" if args.events
+          else f"Exported the allocator state to {args.output}" if args.allocator
           else f"Exported {issue_count} issues to {args.output}")
     return 0
 
@@ -518,9 +525,9 @@ def cmd_init(args, start: Path) -> int:
     store = Path(os.environ["CAIRN_DIR"]) if os.environ.get("CAIRN_DIR") else start / STORE_DIRNAME
     if db_path(store).exists():
         raise Refused(f"{db_path(store)} already exists")
-    sources = (args.seed, args.interactions, args.ledger, args.hot)
+    sources = (args.seed, args.interactions, args.events, args.ledger, args.hot)
     if not args.source and any(sources):
-        raise Refused("--seed, --interactions, --ledger and --hot need --from")
+        raise Refused("--seed, --interactions, --events, --ledger and --hot need --from")
     for option in (args.source, *sources):
         if option and not Path(option).is_file():
             raise Refused(f"no such file: {option}")
@@ -534,6 +541,7 @@ def cmd_init(args, start: Path) -> int:
         db_path(store), Path(args.source), args.prefix,
         seed_path=Path(args.seed) if args.seed else None, bd_version=args.bd_version,
         interactions_path=Path(args.interactions) if args.interactions else None,
+        events_path=Path(args.events) if args.events else None,
         ledger_path=Path(args.ledger) if args.ledger else None,
         hot_path=Path(args.hot) if args.hot else None,
         extra_prefixes=load_config(store).get("issue_prefixes", []))
@@ -856,6 +864,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allocator", action="store_true",
                    help="write the allocator state (ids ever issued, child counters) as a seed "
                         "for `init --from ... --seed`, instead of rows")
+    p.add_argument("--events", action="store_true",
+                   help="write the event history (one JSON line per event, oldest first) for "
+                        "`init --from ... --events`, instead of rows")
     p.set_defaults(func=cmd_export)
 
     sub.add_parser("check", help="referential integrity of issues and memory links"
@@ -895,6 +906,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", help="allocator seed from `cairn seed-from-dolt` (ids bd "
                                   "deleted, bd's child counters)")
     p.add_argument("--interactions", help="bd interactions.jsonl (becomes the event history)")
+    p.add_argument("--events", help="a `cairn export --events` file (the tracked "
+                                    ".beads/events.jsonl): the event history comes back")
     p.add_argument("--ledger", help="bd-memgraph ledger (memory timestamps and deletions)")
     p.add_argument("--hot", help="hot list: one memory key per line")
     p.add_argument("--bd-version", help="the bd version that wrote EXPORT (default: from "

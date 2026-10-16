@@ -93,6 +93,35 @@ def export_lines(conn: sqlite3.Connection, include_memories: bool) -> List[str]:
     return lines
 
 
+EVENT_KEYS = ("id", "kind", "issue_id", "memory_key", "actor", "created_at", "data")
+
+
+def event_objects(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """The history in the order it was recorded, as the objects `export --events`
+    writes: every key always present (null when empty), `data` as the object it
+    holds. Recording order is SQLite's rowid: the table is append-only (triggers)
+    and cairn never VACUUMs, so it is the order of the transactions that wrote the
+    rows, and `init --events` inserts in file order. Timestamps alone would not
+    do: they have one-second resolution, and ids are random, so a new event of the
+    same second could land among older ones. This way two exports of one store are
+    equal and a new event is always the last line (git sees an append)."""
+    rows = conn.execute("SELECT id, kind, issue_id, memory_key, actor, created_at, data "
+                        "FROM events ORDER BY rowid").fetchall()
+    out = []
+    for r in rows:
+        obj: Dict[str, Any] = {"_type": "event"}
+        for key in EVENT_KEYS:
+            obj[key] = json.loads(r["data"]) if key == "data" else r[key]
+        out.append(obj)
+    return out
+
+
+def events_lines(conn: sqlite3.Connection) -> List[str]:
+    """`export --events`: one JSON line per history row, oldest first. Not part of
+    bd's export format (bd's has no event rows), so a file of its own."""
+    return [go_json(o) for o in event_objects(conn)]
+
+
 def export_order(row: Any) -> Any:
     """bd's export row order: priority, newest first, then id (measured on bd
     1.1.2: ORDER BY priority, created_at DESC over an id-ordered scan; created_at

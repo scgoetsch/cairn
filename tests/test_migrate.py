@@ -223,6 +223,163 @@ class FreshCheckoutTest(StoreCase):
         self.assertIn("shadow", err)
 
 
+class EventsExportTest(StoreCase):
+    """workspace-7m8.15: the history leaves the box. `export --events` is a deterministic file
+    git can carry beside the JSONL exports, and `init --from ... --events` brings it back."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ.pop("BEADS_ACTOR", None)
+
+    def live(self, name: str = "live") -> Path:
+        d = self.workspace / name
+        d.mkdir()
+        self.assertEqual(self.cli("init", "-p", "t", cwd=d)[0], 0)
+        return d
+
+    def w(self, cwd: Path, *argv: str) -> str:
+        code, out, err = self.cli(*argv, "--actor", "al", cwd=cwd)
+        self.assertEqual(code, 0, f"{argv}: {err}")
+        return out.strip()
+
+    def test_shape_order_and_rebuild(self):
+        live = self.live()
+        root = self.w(live, "create", "--silent", "--title", "root")
+        kid = self.w(live, "create", "--silent", "--title", "kid", "--parent", root)
+        self.w(live, "update", kid, "--claim")
+        self.w(live, "close", kid)
+        self.w(live, "remember", "--key", "m", "a body")
+        self.w(live, "delete", kid, "--force")
+        code, out, err = self.cli("export", "--events", cwd=live)
+        self.assertEqual(code, 0, err)
+        lines = out.splitlines()
+        rows = [json.loads(l) for l in lines]
+        conn = sqlite3.connect(db_path(live / ".cairn"))
+        self.addCleanup(conn.close)
+        self.assertEqual(len(rows), conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+        self.assertGreaterEqual(len(rows), 6)
+        for row in rows:
+            self.assertEqual(list(row), ["_type", "id", "kind", "issue_id", "memory_key",
+                                         "actor", "created_at", "data"])
+            self.assertEqual(row["_type"], "event")
+            self.assertIsInstance(row["data"], dict)
+            self.assertEqual(row["actor"], "al")
+        stamps = [r["created_at"] for r in rows]
+        self.assertEqual(stamps, sorted(stamps))
+        self.assertIn("m", {r["memory_key"] for r in rows})
+        self.assertEqual(self.cli("export", "--events", cwd=live)[1], out, "two exports differ")
+
+        # What git carries rebuilds the history, byte for byte.
+        issues, mems, alloc, events = (self.workspace / n for n in (
+            "issues.jsonl", "memories.jsonl", "allocator.json", "events.jsonl"))
+        _, all_rows, _ = self.cli("export", "--all", cwd=live)
+        (self.workspace / "both.jsonl").write_text(all_rows)
+        self.assertEqual(self.cli("export", "--allocator", "-o", str(alloc), cwd=live)[0], 0)
+        code, msg, err = self.cli("export", "--events", "-o", str(events), cwd=live)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"Exported {len(rows)} events", msg)
+        self.assertEqual(events.read_text(), out)
+        fresh = self.workspace / "fresh"
+        fresh.mkdir()
+        code, report, err = self.cli("init", "-p", "t", "--from", str(self.workspace / "both.jsonl"),
+                                     "--seed", str(alloc), "--events", str(events), "--json",
+                                     cwd=fresh)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(report)["counts"]["events"], len(rows))
+        self.assertEqual(self.cli("export", "--events", cwd=fresh)[1], out)
+        # A later write appends: the old file is a prefix of the new one (git sees an append).
+        self.w(fresh, "create", "--silent", "--title", "later")
+        later = self.cli("export", "--events", cwd=fresh)[1]
+        self.assertTrue(later.startswith(out))
+        self.assertEqual(len(later.splitlines()), len(rows) + 1)
+
+    def test_events_is_a_file_of_its_own(self):
+        live = self.live()
+        for extra in (("--all",), ("--include-memories",), ("--allocator",)):
+            code, _, err = self.cli("export", "--events", *extra, cwd=live)
+            self.assertEqual(code, 2, extra)
+            self.assertIn("alone", err)
+        _, out, _ = self.cli("export", "--all", cwd=live)
+        self.assertNotIn('"_type":"event"', out)
+
+    def test_init_refuses_a_bad_events_file_and_writes_nothing(self):
+        both = write_jsonl(self.workspace / "both.jsonl", [issue("t-a")])
+        good = {"_type": "event", "id": "ev-1", "kind": "created", "issue_id": "t-a",
+                "memory_key": None, "actor": "al", "created_at": "2026-10-01T00:00:00Z",
+                "data": {"title": "x"}}
+        cases = {
+            "not an event row": [dict(good, _type="issue")],
+            "missing or empty 'kind'": [dict(good, kind="")],
+            "duplicate event id": [good, dict(good, created_at="2026-10-02T00:00:00Z")],
+            "'data' must be an object": [dict(good, data="x")],
+            "unknown key(s) from_the_future": [dict(good, from_the_future=1)],
+        }
+        for message, rows_ in cases.items():
+            with self.subTest(message):
+                target = self.workspace / message.replace(" ", "_").replace("'", "")
+                target.mkdir()
+                bad = write_jsonl(self.workspace / "bad.jsonl", rows_)
+                code, _, err = self.cli("init", "-p", "t", "--from", str(both), "--events",
+                                        str(bad), cwd=target)
+                self.assertEqual(code, 2, err)
+                self.assertIn(message, err)
+                self.assertFalse(db_path(target / ".cairn").exists())
+        # bd's audit log and an events file naming the same id: refused, not merged.
+        log = write_jsonl(self.workspace / "interactions.jsonl", [{
+            "id": "ev-1", "kind": "field_change", "created_at": "2026-09-01T10:00:00Z",
+            "actor": "ann", "issue_id": "t-a", "extra": {}}])
+        ev = write_jsonl(self.workspace / "ev.jsonl", [good])
+        target = self.workspace / "clash"
+        target.mkdir()
+        code, _, err = self.cli("init", "-p", "t", "--from", str(both), "--interactions",
+                                str(log), "--events", str(ev), cwd=target)
+        self.assertEqual(code, 2, err)
+        self.assertIn("UNIQUE", err)
+        self.assertFalse(db_path(target / ".cairn").exists())
+        # Needs --from, like the other sources.
+        code, _, err = self.cli("init", "-p", "t", "--events", str(ev), cwd=self.workspace)
+        self.assertEqual(code, 2)
+        self.assertIn("--events", err)
+
+    def test_init_refuses_when_the_history_would_not_come_back(self):
+        # The self-check's failure branch. Nothing in the importer can make it fire on its own
+        # (what is inserted is what is read back), so the read-back is faked to drop a field.
+        from unittest import mock
+        from cairn import queries
+        both = write_jsonl(self.workspace / "both.jsonl", [issue("t-a")])
+        ev = write_jsonl(self.workspace / "ev.jsonl", [{
+            "_type": "event", "id": "ev-1", "kind": "created", "issue_id": "t-a",
+            "memory_key": None, "actor": "al", "created_at": "2026-10-01T00:00:00Z", "data": {}}])
+        real = queries.event_objects
+
+        def lossy(conn):
+            rows = real(conn)
+            for row in rows:
+                row["actor"] = None
+            return rows
+        target = self.workspace / "lossy"
+        target.mkdir()
+        with mock.patch.object(queries, "event_objects", lossy):
+            code, _, err = self.cli("init", "-p", "t", "--from", str(both), "--events", str(ev),
+                                    cwd=target)
+        self.assertEqual(code, 2, err)
+        self.assertIn("would not come back as they went in", err)
+        self.assertIn("ev-1", err)
+        self.assertFalse(db_path(target / ".cairn").exists())
+
+    def test_imported_bd_history_is_exported_too(self):
+        log = write_jsonl(self.workspace / "interactions.jsonl", [{
+            "id": "int-1", "kind": "field_change", "created_at": "2026-09-01T10:00:00Z",
+            "actor": "ann", "issue_id": "t-a", "extra": {"field": "status", "new": "closed"}}])
+        self.build([issue("t-a")], interactions_path=log)
+        code, out, err = self.cli("export", "--events")
+        self.assertEqual(code, 0, err)
+        rows = [json.loads(l) for l in out.splitlines()]
+        self.assertEqual([r["id"] for r in rows], ["int-1"])
+        self.assertEqual(rows[0]["data"], {"field": "status", "new": "closed"})
+        self.assertIsNone(rows[0]["memory_key"])
+
+
 class WorktreeRedirectTest(StoreCase):
     def test_a_redirect_names_the_main_store(self):
         os.environ.pop("BEADS_ACTOR", None)

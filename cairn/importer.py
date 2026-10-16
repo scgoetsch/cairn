@@ -318,6 +318,7 @@ def _load_hot(path: Optional[Path]) -> List[str]:
 
 def import_into(conn: sqlite3.Connection, export_path: Path, *,
                 interactions_path: Optional[Path] = None,
+                events_path: Optional[Path] = None,
                 ledger_path: Optional[Path] = None,
                 hot_path: Optional[Path] = None,
                 source_label: str = "",
@@ -414,6 +415,8 @@ def import_into(conn: sqlite3.Connection, export_path: Path, *,
             except sqlite3.IntegrityError as exc:
                 raise SourceError(f"{where}: {exc}") from exc
             events += 1
+    if events_path is not None and events_path.is_file():
+        events += import_events(conn, events_path)
 
     dep_order = detect_dep_order([r for _, r in issue_rows])
     if dep_order is None:
@@ -438,6 +441,50 @@ def import_into(conn: sqlite3.Connection, export_path: Path, *,
         "events": events,
     }
     return report
+
+
+def import_events(conn: sqlite3.Connection, path: Path) -> int:
+    """Load a `cairn export --events` file (the tracked .beads/events.jsonl) into
+    the events table, in file order. Then check, per id, that what the store now
+    exports for each event equals what the file held: every event is present
+    with its content. The ORDER of the file is kept by construction (inserted in
+    file order, exported by rowid) and pinned by EventsExportTest, not by this
+    check. A row with a key this build does not know is refused rather than
+    stored without it. Raises SourceError; nothing is skipped."""
+    from .queries import EVENT_KEYS, event_objects
+    known = {"_type", *EVENT_KEYS}
+    want: Dict[str, Dict[str, Any]] = {}
+    for lineno, row in read_jsonl(path):
+        where = f"{path}:{lineno}"
+        if row.get("_type") != "event":
+            raise SourceError(f"{where}: not an event row (_type {row.get('_type')!r})")
+        unknown = sorted(set(row) - known)
+        if unknown:
+            raise SourceError(f"{where}: unknown key(s) {', '.join(unknown)} (written by a newer "
+                              f"cairn? this build keeps {', '.join(EVENT_KEYS)})")
+        data = row.get("data")
+        if not isinstance(data, dict):
+            raise SourceError(f"{where}: 'data' must be an object")
+        event_id = _require_str(row, "id", where)
+        if event_id in want:
+            raise SourceError(f"{where}: duplicate event id {event_id}")
+        try:
+            conn.execute(
+                "INSERT INTO events(id, kind, issue_id, memory_key, actor, created_at, data) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (event_id, _require_str(row, "kind", where),
+                 _optional_str(row, "issue_id", where), _optional_str(row, "memory_key", where),
+                 _optional_str(row, "actor", where), _require_str(row, "created_at", where),
+                 json.dumps(data, sort_keys=True)))
+        except sqlite3.IntegrityError as exc:
+            raise SourceError(f"{where}: {exc}") from exc
+        want[event_id] = {"_type": "event", **{k: row.get(k) for k in EVENT_KEYS}}
+    got = {o["id"]: o for o in event_objects(conn) if o["id"] in want}
+    lost = sorted(i for i in want if got.get(i) != want[i])
+    if lost:
+        raise SourceError(f"{path}: {len(lost)} event(s) would not come back as they went in: "
+                          + ", ".join(lost[:5]))
+    return len(want)
 
 
 def refuse_if_writable(target: Path) -> None:

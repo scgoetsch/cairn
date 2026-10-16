@@ -40,7 +40,7 @@ cairn list  [--status=in_progress] [--all] [--json] [-n N]
 cairn blocked | show ID | stats | where | check
 cairn memories [keyword] | recall KEY
 cairn prime [--budget BYTES]         # default 10000: what Claude Code shows of a hook in full
-cairn export [--include-memories | --all] [-o FILE]
+cairn export [--include-memories | --all | --allocator | --events] [-o FILE]
 cairn import FILE [--interactions F] [--ledger F] [--hot F]   # build from files, no bd
 cairn seed-from-dolt BEADS_DIR [--dolt PATH] [-o FILE]        # allocator seed, see below
 cairn migrate                                                 # writable store -> this schema
@@ -50,7 +50,7 @@ Writable stores (`--actor`, else `$BEADS_ACTOR`, else git user.name; a claim
 requires `--actor` or `$BEADS_ACTOR`):
 
 ```bash
-cairn init --prefix proj [--from EXPORT [--seed F] [--interactions F] [--ledger F] [--hot F]]
+cairn init --prefix proj [--from EXPORT [--seed F] [--interactions F] [--events F] [--ledger F] [--hot F]]
 cairn create "Title" [-d TEXT|--body-file F] [-p P] [-t TYPE] [--parent ID] [-l a,b] [--silent]
 cairn update ID... [--claim] [--status S] [--assignee A] [--title T] [-d T] [--notes T]
                    [--append-notes T] [--design T] [--acceptance T] [-p P] [-t T]
@@ -148,11 +148,16 @@ and in the table above.
 
 ### What git must carry, and worktrees
 
-The database is git-ignored. What rebuilds it is the two JSONL exports plus the allocator state:
-`cairn export --allocator -o .beads/allocator.json` writes every id ever issued and each parent's
-last child number, in the seed format, and a fresh checkout rebuilds with
-`cairn init -p P --from <issues + memories> --seed .beads/allocator.json` without reissuing an id
-(`FreshCheckoutTest`). A git worktree checks out `.cairn/config.json` but no database; an untracked
+The database is git-ignored. What rebuilds it is the two JSONL exports plus two files bd's export
+format has no rows for: `cairn export --allocator -o .beads/allocator.json` writes every id ever
+issued and each parent's last child number, in the seed format; `cairn export --events -o
+.beads/events.jsonl` writes the history, one JSON line per event, oldest first, every key present
+(`id`, `kind`, `issue_id`, `memory_key`, `actor`, `created_at`, `data` as an object). Two exports of
+one store are equal and a new event lands at the end, so git sees an append. A fresh checkout
+rebuilds with `cairn init -p P --from <issues + memories> --seed .beads/allocator.json --events
+.beads/events.jsonl` without reissuing an id and with its history (`FreshCheckoutTest`,
+`EventsExportTest`); `init` checks that every event came back with its content (per id; the order
+is the file's by construction and pinned by the test) and refuses a row with a key it does not know. A git worktree checks out `.cairn/config.json` but no database; an untracked
 `.cairn/redirect` holding the absolute path of the main `.cairn/` points every verb there (one hop).
 
 `migrate` applies the numbered steps in `store.MIGRATIONS`. It holds the write
@@ -350,7 +355,8 @@ explains a link to a deleted key, and flags an issue with more than one parent.
 - `bd import` of `cairn export --all` reproduces the export byte for byte
   (measured, `RoundTripTest`), but bd's child counter then restarts from the children it
   sees and hands out numbers cairn had deleted. A rollback into bd must burn
-  those numbers first. Events and `used_ids` do not travel in the export.
+  those numbers first. Events and `used_ids` do not travel in that export; `export --events`
+  and `export --allocator` carry them in files of their own (see "What git must carry").
 - One issue prefix per store. `init --from` refuses an export holding issues under another prefix,
   and a seed naming one, before it writes anything (`issue_prefixes` in `.cairn/config.json` is
   for links in memory bodies, not for issues).
