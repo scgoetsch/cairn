@@ -772,11 +772,15 @@ def cmd_dep(args, start: Path) -> int:
 
 def cmd_remember(args, start: Path) -> int:
     writer = open_writer(args, start)
-    new, related = writer.remember(args.key or "", args.value, force=args.force)
+    new, related, near = writer.remember(args.key or "", args.value, force=args.force)
     if args.json:
         emit_json({"key": args.key, "status": "created" if new else "updated"})
     elif not args.quiet:
         print(f"{'Remembered' if new else 'Updated'} [{args.key}]: {args.value[:PREVIEW]}")
+    if near and not args.quiet:
+        print(f"note: nearly duplicates memory '{near}' (stored: a short body is not refused); "
+              f"if it adds to that memory, merge it in (cairn recall {near}, then cairn remember "
+              f"--key {near} \"<merged>\") and forget this key", file=sys.stderr)
     if related and not args.quiet:
         links_hint = " ".join(f"[[{k}]]" for k in related)
         print(f"note: related to {links_hint} but links to no memory; add the link that "

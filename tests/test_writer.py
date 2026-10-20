@@ -415,7 +415,8 @@ class MemoryTest(WritableCase):
 class AdmissionTest(WritableCase):
     """remember carries bd-memgraph's evolve (workspace-7m8.20)."""
     BODY = ("sov2 scale runs: cairn ready latency stays under one second at thirty "
-            "thousand issues while bd times out under eight workers")
+            "thousand issues while bd times out under eight workers; the claim storm "
+            "has one winner, exports stay identical, and the rebuild reissues no id")
 
     def test_a_near_duplicate_of_another_key_is_refused_and_names_it(self):
         self.w("remember", "--key", "scale-results", self.BODY)
@@ -426,6 +427,15 @@ class AdmissionTest(WritableCase):
         self.assertIn("cairn recall scale-results", err)
         code, _, _ = self.cli("recall", "scale-again")
         self.assertEqual(code, 1)
+
+    def test_a_short_near_duplicate_is_stored_with_the_advice(self):
+        # Under MIN_WORDS_TO_REFUSE the score is mostly the floor: advice, not a refusal.
+        self.w("remember", "--key", "scale-results", self.BODY)
+        code, _, err = self.cli("remember", "--key", "scale-short",
+                                "cairn ready latency at thirty thousand issues", "--actor", "x")
+        self.assertEqual(code, 0, err)
+        self.assertIn("nearly duplicates memory 'scale-results'", err)
+        self.assertIn("cairn recall scale-results", err)
 
     def test_force_stores_it_anyway(self):
         self.w("remember", "--key", "scale-results", self.BODY)

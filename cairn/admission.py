@@ -22,6 +22,11 @@ STOP = set(
 )
 NEAR_DUPLICATE = 0.5
 RELATED = 0.18
+# Below this many distinct words a draft's score is mostly the floor of 6 doing the work: three
+# shared words make 0.5. Measured 2026-10-20: this store's memories run 53-360 words, and a
+# rehearsal's 5-word test memory was refused against an unrelated key. A shorter near-duplicate
+# is stored with the advice instead (operator, 2026-10-20).
+MIN_WORDS_TO_REFUSE = 20
 
 
 def tokens(text: str) -> Set[str]:

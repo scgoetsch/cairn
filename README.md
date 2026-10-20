@@ -317,9 +317,11 @@ Writes (each pinned in `tests/test_writer.py` or `tests/test_drill.py`):
   last touched when none is given.
 - `remember` needs `--key`; bd generates one.
 - `remember` runs admission control (bd-memgraph's `evolve`, folded in): a body
-  that is a near-duplicate of another key (token overlap at least 0.5) is refused,
-  exit 1, naming that key and the update recipe; `--force` stores it anyway, and a
-  key the body `supersedes::` is not a candidate. A related body (0.18 or more)
+  of at least 20 distinct words that is a near-duplicate of another key (token
+  overlap at least 0.5) is refused, exit 1, naming that key and the update recipe;
+  `--force` stores it anyway, and a key the body `supersedes::` is not a candidate.
+  A shorter near-duplicate is stored, with that key named on stderr (over so few
+  words three shared ones reach 0.5). A related body (0.18 or more)
   that links to no memory is stored with a note on stderr naming keys to link.
   Rewriting the same key is never refused. bd stores every body.
 - `delete` without `--force` is refused (exit 2); bd prints a preview and exits
