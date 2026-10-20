@@ -72,6 +72,16 @@ class SyncTest(StoreCase):
         self.assertEqual(self.ok(self.a, "export", "--all"), self.ok(self.b, "export", "--all"))
         self.assertEqual(self.ok(self.a, "export", "--events"), self.ok(self.b, "export", "--events"))
 
+    def test_a_fresh_clone_builds_before_any_event_was_written(self):
+        # A store moved from bd without an interactions log has no history until its first
+        # cairn write: the clone gets issues, memories and the allocator but no events.jsonl.
+        self.started()
+        (self.b / ".beads" / "events.jsonl").unlink()
+        code, _, err = self.cli("ready", cwd=self.b)
+        self.assertIn("cairn sync", err)
+        self.ok(self.b, "sync")
+        self.assertEqual(self.ok(self.a, "export", "--all"), self.ok(self.b, "export", "--all"))
+
     def test_the_prefix_comes_from_the_issues_when_config_has_none(self):
         self.started()
         (self.b / ".cairn" / "config.json").write_text("{}\n")

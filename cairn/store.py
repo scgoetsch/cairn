@@ -232,7 +232,8 @@ def create_db(path: Path) -> sqlite3.Connection:
 def open_db(path: Path) -> sqlite3.Connection:
     """Open an existing store read-only. Read verbs never write."""
     if not path.is_file():
-        if (path.parent.parent / ".beads" / "events.jsonl").is_file():
+        beads = path.parent.parent / ".beads"
+        if (beads / "allocator.json").is_file() or (beads / "events.jsonl").is_file():
             raise StoreError(f"no store database at {path} (a fresh clone?) — run `cairn sync` "
                              "to build it from the tracked exports in .beads/")
         raise StoreError(

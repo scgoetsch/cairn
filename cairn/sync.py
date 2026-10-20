@@ -179,9 +179,10 @@ def sync(store_dir: Path, *, hot_path: Optional[Path] = None) -> SyncResult:
             return SyncResult(state, detail)
     else:
         state, detail = BEHIND, "no store database here yet (a fresh clone)"
-    missing = [n for n in (ISSUES, EVENTS) if not (beads / n).is_file()]
-    if missing:
-        raise StoreError(f"nothing to rebuild from: {beads} lacks {', '.join(missing)}")
+    # A store moved from bd without an interactions log has no history until its first cairn
+    # write, so no events.jsonl yet: the rows and the allocator are then the whole state.
+    if not (beads / ISSUES).is_file():
+        raise StoreError(f"nothing to rebuild from: {beads} lacks {ISSUES}")
     prefix = resolve_prefix(store_dir)
     with tempfile.TemporaryDirectory(prefix="cairn-sync-") as tmp:
         source = Path(tmp) / "export.jsonl"
@@ -192,7 +193,7 @@ def sync(store_dir: Path, *, hot_path: Optional[Path] = None) -> SyncResult:
         fresh = store_dir / f"{DB_FILENAME}.sync-{os.getpid()}"
         seed = beads / ALLOCATOR
         build_writable(fresh, source, prefix, seed_path=seed if seed.is_file() else None,
-                       events_path=beads / EVENTS,
+                       events_path=beads / EVENTS if (beads / EVENTS).is_file() else None,
                        hot_path=hot_path if hot_path and hot_path.is_file() else None,
                        extra_prefixes=load_config(store_dir).get("issue_prefixes", []))
         try:
