@@ -381,6 +381,56 @@ def recall(conn: sqlite3.Connection, key: str) -> Optional[sqlite3.Row]:
 
 # -- health -----------------------------------------------------------------
 
+def blocks_cycles(conn: sqlite3.Connection) -> List[List[str]]:
+    """Each set of issues that block one another in a cycle (a strongly connected
+    component of the blocks edges with more than one member), members sorted,
+    sets sorted. Iterative Tarjan: dependency chains can be deeper than the
+    recursion limit. A self edge is reported by check on its own."""
+    edges: Dict[str, List[str]] = {}
+    for src, dst in conn.execute("SELECT issue_id, depends_on_id FROM dependencies "
+                                 "WHERE type = ? ORDER BY issue_id, depends_on_id",
+                                 (BLOCKING_TYPE,)):
+        edges.setdefault(src, []).append(dst)
+    index: Dict[str, int] = {}
+    low: Dict[str, int] = {}
+    on_stack = set()
+    stack: List[str] = []
+    found: List[List[str]] = []
+    for root in sorted(edges):
+        if root in index:
+            continue
+        work = [(root, 0)]
+        while work:
+            node, i = work.pop()
+            if i == 0:
+                index[node] = low[node] = len(index)
+                stack.append(node)
+                on_stack.add(node)
+            succ = edges.get(node, [])
+            if i < len(succ):
+                work.append((node, i + 1))
+                nxt = succ[i]
+                if nxt not in index:
+                    work.append((nxt, 0))
+                elif nxt in on_stack:
+                    low[node] = min(low[node], index[nxt])
+                continue
+            if low[node] == index[node]:
+                members = []
+                while True:
+                    top = stack.pop()
+                    on_stack.discard(top)
+                    members.append(top)
+                    if top == node:
+                        break
+                if len(members) > 1:
+                    found.append(sorted(members))
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+    return sorted(found)
+
+
 def check(conn: sqlite3.Connection) -> Dict[str, List[str]]:
     """Referential integrity.
 
@@ -409,6 +459,10 @@ def check(conn: sqlite3.Connection) -> Dict[str, List[str]]:
             "SELECT issue_id, COUNT(*) AS n FROM dependencies WHERE type = ? "
             "GROUP BY issue_id HAVING n > 1 ORDER BY issue_id", (PARENT_TYPE,)):
         errors.append(f"{row['issue_id']} has {row['n']} parents (expected at most one)")
+    # dep add refuses a blocks cycle (as bd does); a store written before that,
+    # or imported, can still hold one, and its members are missing from ready.
+    for members in blocks_cycles(conn):
+        errors.append(f"blocks cycle: {', '.join(members)} (none of them can become ready)")
 
     if "schema_version" in keys:
         warnings.append("memory key 'schema_version' collides with the key bd's JSON "

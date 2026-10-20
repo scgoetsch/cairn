@@ -147,6 +147,13 @@ class DrillTest(unittest.TestCase):
         for st in hidden:
             self.assertNotIn("Root", st["ready"])
             self.assertIn("Root", st["blocked"])
+        # the edge that would close a blocks cycle: both refuse, exit 1 (workspace-7m8.19)
+        results = self.both("dep", "add", "Blocker", "Root")
+        self.assertEqual([r[0] for r in results], [1, 1])
+        for r in results:
+            self.assertIn("adding dependency would create a cycle", r[2])
+        for st in (s.state() for s in self.sides):
+            self.assertIn("Blocker", st["ready"])
         self.same_exit("close", "Blocker", "--reason", "fixed")
         for st in (s.state() for s in self.sides):
             self.assertIn("Root", st["ready"])

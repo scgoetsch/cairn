@@ -267,6 +267,15 @@ Measured on a throwaway bd 1.1.2 store and pinned by `tests/test_semantics.py`:
   parent that still carries a future `defer_until` hides its children.
 - **order**: priority ascending, `created_at` descending to the second, id ascending.
 - `related` and `discovered-from` dependencies never block.
+- **cycles**: `dep add` refuses a `blocks` edge that would close a cycle of
+  `blocks` edges, at any length, exit 1, `adding dependency would create a
+  cycle` (1.1.2 and 1.3.0). On 1.1.2 the walk ignores status (a closed issue on
+  the path still counts) and every other type: a `blocks` edge against a
+  `parent-child` edge, and `related` or `discovered-from` both ways, are
+  accepted (not measured on 1.3.x). cairn refuses
+  the same edges and names the path; pinned in `tests/test_writer.py` and
+  `tests/test_drill.py`. `cairn check` reports, as an error, any `blocks` cycle
+  a store already holds (one written before cairn refused them, or imported).
 - `dependency_count` / `dependent_count` count `blocks` edges only in `list`,
   `ready` and `export`, but edges of every type in `show` (so an epic's children
   are dependents there). cairn reproduces both.

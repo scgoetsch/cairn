@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -291,6 +292,57 @@ class DependencyTest(WritableCase):
         code, _, err = self.cli("dep", "add", kid, b, "--type", "parent-child", "--actor", "x")
         self.assertEqual(code, 2)
         self.assertIn("already has a parent", err)
+
+    def test_a_blocks_cycle_is_refused_as_bd_refuses_it(self):
+        # bd 1.1.2 and 1.3.0, measured (workspace-7m8.19): exit 1, "adding
+        # dependency would create a cycle", through any number of blocks edges.
+        a, b, c = self.new("a"), self.new("b"), self.new("c")
+        self.w("dep", "add", a, b)
+        self.w("dep", "add", b, c)
+        code, _, err = self.cli("dep", "add", c, a, "--actor", "x")
+        self.assertEqual(code, 1)
+        self.assertIn("adding dependency would create a cycle", err)
+        self.assertIn(f"{c} -> {a} -> {b} -> {c}", err)
+        self.assertEqual(len(self.snap().deps), 2)
+        self.assertEqual([e["kind"] for e in self.events(c)], ["created"])
+        self.assertIn(c, self.ready())
+
+    def test_a_closed_issue_on_the_path_still_closes_the_cycle(self):
+        a, b = self.new("a"), self.new("b")
+        self.w("dep", "add", a, b)
+        self.w("close", b)
+        code, _, err = self.cli("dep", "add", b, a, "--actor", "x")
+        self.assertEqual(code, 1, err)
+
+    def test_only_blocks_edges_make_a_cycle(self):
+        # bd accepts each of these (measured): the walk follows blocks edges only.
+        p, k = self.new("p"), self.new("k")
+        self.w("dep", "add", k, p, "--type", "parent-child")
+        self.w("dep", "add", p, k)
+        x, y = self.new("x"), self.new("y")
+        self.w("dep", "add", x, y)
+        self.w("dep", "add", y, x, "--type", "related")
+        self.w("dep", "add", y, x, "--type", "discovered-from")
+        code, out, _ = self.cli("check", "--json")
+        self.assertEqual(code, 0, out)
+
+    def test_check_names_a_blocks_cycle_already_in_the_store(self):
+        # A store written before dep add refused cycles can hold one.
+        a, b, c, d = self.new("a"), self.new("b"), self.new("c"), self.new("d")
+        self.w("dep", "add", a, b)
+        self.w("dep", "add", b, c)
+        self.w("dep", "add", d, a)
+        conn = sqlite3.connect(db_path(self.store_dir))      # a writable connection
+        self.addCleanup(conn.close)
+        with conn:
+            conn.execute("INSERT INTO dependencies(issue_id, depends_on_id, type, created_at, "
+                         "created_by) VALUES (?, ?, 'blocks', '2026-10-19T00:00:00Z', 'old')",
+                         (c, a))
+        code, out, _ = self.cli("check", "--json")
+        self.assertEqual(code, 1)
+        cycles = [e for e in json.loads(out)["errors"] if e.startswith("blocks cycle")]
+        self.assertEqual(cycles, [f"blocks cycle: {', '.join(sorted([a, b, c]))} "
+                                  "(none of them can become ready)"])
 
     def test_dep_remove_takes_every_type(self):
         a, b = self.new("a"), self.new("b")

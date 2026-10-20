@@ -33,18 +33,19 @@ import secrets
 import sqlite3
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from . import links, timeutil
 from .importer import body_hash
-from .queries import PARENT_TYPE, Snapshot
+from .queries import BLOCKING_TYPE, PARENT_TYPE, Snapshot
 from .store import STATUSES, get_meta
 
 ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 MIN_WIDTH = 3
 TRIES_PER_WIDTH = 64
-DEP_TYPES = ("blocks", PARENT_TYPE, "related", "discovered-from")
+DEP_TYPES = (BLOCKING_TYPE, PARENT_TYPE, "related", "discovered-from")
 FIELD_COLUMNS = ("title", "description", "design", "acceptance_criteria", "notes",
                  "priority", "issue_type", "assignee", "status", "defer_until")
 DEFAULT_CLOSE_REASON = "Closed"
@@ -483,9 +484,39 @@ class Writer:
                 if other is not None:
                     raise WriteRefused(f"{issue_id} already has a parent ({other[0]}); "
                                        "an issue has one parent")
+            if dep_type == BLOCKING_TYPE:
+                path = self._blocks_path(depends_on, issue_id)
+                if path is not None:
+                    raise WriteConflict("adding dependency would create a cycle: "
+                                        + " -> ".join([issue_id] + path))
             self._insert_dep(now, issue_id, depends_on, dep_type)
             self.conn.execute("UPDATE issues SET updated_at = ? WHERE id = ?", (now, issue_id))
         return True
+
+    def _blocks_path(self, start: str, goal: str) -> Optional[List[str]]:
+        """The blocks edges from `start` to `goal` (start first, goal last), or
+        None. bd walks blocks edges only, whatever the issues' status (measured on
+        1.1.2; the refusal itself also on 1.3.0; workspace-7m8.19): a closed issue on
+        the path still counts, a parent-child or related edge does not. Neighbours
+        are read per node through the primary key, so the walk touches only what
+        `start` reaches, not the whole graph."""
+        came_from: Dict[str, Optional[str]] = {start: None}
+        queue = deque([start])
+        while queue:
+            node = queue.popleft()
+            if node == goal:
+                path = []
+                while node is not None:
+                    path.append(node)
+                    node = came_from[node]
+                return path[::-1]
+            for (nxt,) in self.conn.execute(
+                    "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = ? "
+                    "ORDER BY depends_on_id", (node, BLOCKING_TYPE)):
+                if nxt not in came_from:
+                    came_from[nxt] = node
+                    queue.append(nxt)
+        return None
 
     def dep_remove(self, issue_id: str, depends_on: str) -> int:
         """Remove every edge from A to B, whatever its type (bd's behaviour)."""
