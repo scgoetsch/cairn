@@ -107,13 +107,15 @@ def event_objects(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     equal and a new event is always the last line (git sees an append)."""
     rows = conn.execute("SELECT id, kind, issue_id, memory_key, actor, created_at, data "
                         "FROM events ORDER BY rowid").fetchall()
-    out = []
-    for r in rows:
-        obj: Dict[str, Any] = {"_type": "event"}
-        for key in EVENT_KEYS:
-            obj[key] = json.loads(r["data"]) if key == "data" else r[key]
-        out.append(obj)
-    return out
+    return [event_object(r) for r in rows]
+
+
+def event_object(row: Any) -> Dict[str, Any]:
+    """One events row as `export --events` writes it."""
+    obj: Dict[str, Any] = {"_type": "event"}
+    for key in EVENT_KEYS:
+        obj[key] = json.loads(row["data"]) if key == "data" else row[key]
+    return obj
 
 
 def events_lines(conn: sqlite3.Connection) -> List[str]:

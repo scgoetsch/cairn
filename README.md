@@ -160,6 +160,29 @@ rebuilds with `cairn init -p P --from <issues + memories> --seed .beads/allocato
 is the file's by construction and pinned by the test) and refuses a row with a key it does not know. A git worktree checks out `.cairn/config.json` but no database; an untracked
 `.cairn/redirect` holding the absolute path of the main `.cairn/` points every verb there (one hop).
 
+### More than one clone: `cairn sync`
+
+Worktrees on one machine share one database through the redirect. Another clone (another
+machine, CI, a re-clone) has its own, and git carries only the four files. `cairn sync` brings a
+clone's database up to them. It compares the store's event history with `.beads/events.jsonl`:
+a later export of one store is a string prefix of the new one, so the two are **equal**, the
+store is **ahead** (writes not exported yet: the export refresh writes them), the store is
+**behind** (a pull brought another clone's work: `sync` rebuilds the database from the four files,
+which hold everything it has, and keeps the old one as `cairn.db.before-sync-<time>`), or they
+**diverged** (both clones wrote: refused, and `sync` says where the histories part). There is no
+merge; one side's writes are redone by hand. A fresh clone has no database at all and `sync`
+builds it, with the prefix `init` recorded in `.cairn/config.json` (or, failing that, the one
+prefix of the issue ids). Unmerged export files in git are never rebuilt from.
+
+While the store is behind or diverged every write is refused (exit 2) with the command to run,
+so nobody claims work another clone already closed; reads still work and warn on stderr. `sync
+--status` says which state it is (exit 1 behind, 2 diverged). The check that runs on every verb
+compares one line, where the two histories meet; `sync` compares them whole before it changes
+anything, under the store's write lock, and a write that was waiting for that lock refuses
+instead of landing in the replaced file. Not carried by a rebuild: memory tombstones (`forget`
+and the cutover write them; the exports do not hold them), so after one `check` names a link to a
+forgotten key as dangling without saying when it was deleted.
+
 `migrate` applies the numbered steps in `store.MIGRATIONS`. It holds the write
 lock, writes `cairn.db.v<N>.bak` first, runs every step in one transaction,
 checks foreign keys before committing, and removes the backup again if a step

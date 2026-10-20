@@ -21,12 +21,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from . import PROG, __version__, doltseed, prime, shadow, timeutil
+from . import PROG, __version__, doltseed, prime, shadow, sync as syncmod, timeutil
 from .importer import ENV_PREFIXES, SourceError, build_store, build_writable
 from .queries import (LINKED_OMITS, Snapshot, check, events_lines, export_lines, memories,
                       recall, stats)
 from .store import (GITIGNORE, STORE_DIRNAME, StoreError, db_path, find_store_dir,
-                    init_store, load_config, migrate, open_db, open_writable)
+                    get_meta, init_store, load_config, migrate, open_db, open_writable)
 from .writer import WriteConflict, WriteRefused, Writer
 
 GLYPH = {"open": "○", "in_progress": "◐", "blocked": "●", "closed": "✓", "deferred": "❄"}
@@ -98,8 +98,13 @@ _OPEN: List[sqlite3.Connection] = []
 
 
 def connect(start: Path) -> sqlite3.Connection:
-    conn = open_db(db_path(store_dir_or_fail(start)))
+    store = store_dir_or_fail(start)
+    conn = open_db(db_path(store))
     _OPEN.append(conn)
+    if get_meta(conn, "writable") == "1":
+        state = syncmod.quick_state(conn, store)
+        if state in (syncmod.BEHIND, syncmod.DIVERGED):
+            print(f"{PROG}: warning: {syncmod.stale_message(state, store)}", file=sys.stderr)
     return conn
 
 
@@ -501,10 +506,14 @@ def open_writer(args, start: Path, *, claim: bool = False) -> Writer:
     store = store_dir_or_fail(start)
     conn = open_writable(db_path(store))
     _OPEN.append(conn)
+    state = syncmod.quick_state(conn, store)
+    if state in (syncmod.BEHIND, syncmod.DIVERGED):
+        raise Refused(f"write refused: {syncmod.stale_message(state, store)}")
     prefixes = [*load_config(store).get("issue_prefixes", []),
                 *(p.strip() for p in os.environ.get(ENV_PREFIXES, "").split(",") if p.strip())]
     return Writer(conn, actor=resolve_actor(args, start, claim=claim),
-                  owner=git_config("user.email", start), issue_prefixes=prefixes)
+                  owner=git_config("user.email", start), issue_prefixes=prefixes,
+                  db_file=db_path(store))
 
 
 def report_issues(args, writer: Writer, ids: Sequence[str], verb: str, extra: str = "") -> int:
@@ -520,6 +529,54 @@ def report_issues(args, writer: Writer, ids: Sequence[str], verb: str, extra: st
     return 0
 
 
+def record_prefix(store: Path, prefix: str) -> None:
+    """Write the issue prefix into the tracked .cairn/config.json, so `cairn sync` in a fresh
+    clone knows it without -p. Other keys are kept."""
+    path = store / "config.json"
+    data = load_config(store)
+    if data.get("prefix") == prefix:
+        return
+    data["prefix"] = prefix
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def cmd_sync(args, start: Path) -> int:
+    store = store_dir_or_fail(start) if find_store_dir(start) else start / STORE_DIRNAME
+    if args.status:
+        if not db_path(store).is_file():
+            state, detail = syncmod.BEHIND, "no store database here yet"
+        else:
+            conn = connect_quiet(store)
+            state, detail = syncmod.full_state(conn, store)
+        if syncmod.unmerged(store):
+            state, detail = syncmod.DIVERGED, "export files unmerged in git"
+        if args.json:
+            emit_json({"state": state, "detail": detail})
+        else:
+            print(f"{state}: {detail}")
+        return {syncmod.BEHIND: 1, syncmod.DIVERGED: 2}.get(state, 0)
+    try:
+        result = syncmod.sync(store, hot_path=store.parent / ".claude" / "memory-hot.txt")
+    except StoreError as exc:
+        raise Refused(str(exc)) from exc
+    if args.json:
+        emit_json({"state": result.state, "detail": result.detail, "rebuilt": result.rebuilt,
+                   "backup": str(result.backup) if result.backup else None})
+    elif not args.quiet:
+        if result.rebuilt:
+            kept = f"; the old database is {result.backup}" if result.backup else ""
+            print(f"Synced {store} from {syncmod.exports_dir(store)} ({result.detail}){kept}")
+        else:
+            print(f"Nothing to do: {result.state}, {result.detail}")
+    return 0
+
+
+def connect_quiet(store: Path) -> sqlite3.Connection:
+    conn = open_db(db_path(store))
+    _OPEN.append(conn)
+    return conn
+
+
 def cmd_init(args, start: Path) -> int:
     # CAIRN_DIR names the store directory for every verb, init included.
     store = Path(os.environ["CAIRN_DIR"]) if os.environ.get("CAIRN_DIR") else start / STORE_DIRNAME
@@ -532,6 +589,7 @@ def cmd_init(args, start: Path) -> int:
         if option and not Path(option).is_file():
             raise Refused(f"no such file: {option}")
     ensure_store_dir(store)
+    record_prefix(store, args.prefix)
     if not args.source:
         init_store(db_path(store), args.prefix).close()
         if not args.quiet:
@@ -1020,6 +1078,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true",
                    help="store a body that is a near-duplicate of another key")
     p.set_defaults(func=cmd_remember)
+
+    p = sub.add_parser("sync", help="bring the store up to the tracked exports a pull brought in "
+                       "(a fresh clone builds it); refused when two clones both wrote")
+    p.add_argument("--status", action="store_true",
+                   help="say equal / ahead / behind / diverged; exit 1 behind, 2 diverged")
+    p.add_argument("-q", "--quiet", action="store_true", help="print nothing on success")
+    p.set_defaults(func=cmd_sync)
 
     p = writer_parser("forget", "delete a memory")
     p.add_argument("key")

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import secrets
 import sqlite3
@@ -35,6 +36,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from . import admission, links, timeutil
@@ -103,7 +105,8 @@ def uuid7() -> str:
 
 class Writer:
     def __init__(self, conn: sqlite3.Connection, *, actor: str, owner: Optional[str] = None,
-                 issue_prefixes: Sequence[str] = (), clock=now_iso) -> None:
+                 issue_prefixes: Sequence[str] = (), clock=now_iso,
+                 db_file: Optional[Path] = None) -> None:
         if not actor:
             raise WriteRefused("no actor (set BEADS_ACTOR or pass --actor)")
         self.conn = conn
@@ -112,6 +115,10 @@ class Writer:
         self.prefix = get_meta(conn, "prefix") or ""
         self.issue_prefixes = [self.prefix, *issue_prefixes]
         self.clock = clock
+        # `cairn sync` replaces the file under its write lock; a write that waited for that
+        # lock holds the old file and must not land there.
+        self.db_file = db_file
+        self.db_inode = os.stat(db_file).st_ino if db_file is not None else None
 
     # -- plumbing -----------------------------------------------------------
 
@@ -119,6 +126,10 @@ class Writer:
     def transaction(self) -> Iterator[str]:
         """BEGIN IMMEDIATE ... COMMIT; yields the transaction's timestamp."""
         self.conn.execute("BEGIN IMMEDIATE")
+        if self.db_file is not None and os.stat(self.db_file).st_ino != self.db_inode:
+            self.conn.execute("ROLLBACK")
+            raise WriteConflict("the store was replaced by `cairn sync` while this write waited; "
+                                "run it again")
         try:
             yield self.clock()
         except BaseException:
