@@ -67,6 +67,44 @@ def _line_at(conn: sqlite3.Connection, index: int) -> Optional[str]:
     return None if row is None else go_json(event_object(row))
 
 
+def merging(store_dir: Path) -> bool:
+    """A merge is in progress in the checkout beside the store."""
+    try:
+        out = subprocess.run(["git", "-C", str(store_dir.parent), "rev-parse", "-q", "--verify",
+                              "MERGE_HEAD"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0
+
+
+def committed_lines(store_dir: Path, ref: str) -> Optional[List[str]]:
+    try:
+        out = subprocess.run(["git", "-C", str(store_dir.parent), "show",
+                              f"{ref}:{EXPORTS_DIRNAME}/{EVENTS}"],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return [l for l in out.stdout.split("\n") if l] if out.returncode == 0 else None
+
+
+def merge_holds_nothing_new(conn: sqlite3.Connection, store_dir: Path) -> bool:
+    """Mid-merge, the working events.jsonl holds both branches' lines (conflicted, or joined), a
+    prefix of nothing. What matters is what the two sides COMMITTED: when the store already has
+    both histories, it is ahead of the merge, as with worktrees that share one store (they
+    exported one history, and regenerating the files from the store resolves the conflict). When
+    the other side has events the store lacks, another clone wrote: that stays diverged."""
+    if not merging(store_dir):
+        return False
+    store = events_lines(conn)
+    for ref in ("HEAD", "MERGE_HEAD"):
+        lines = committed_lines(store_dir, ref)
+        if lines is None:
+            continue
+        if store[:len(lines)] != lines:
+            return False
+    return True
+
+
 def quick_state(conn: sqlite3.Connection, store_dir: Path) -> str:
     """The relation, from the line where the two meet only (every verb runs this, so it reads
     one store row, not the history). `sync` runs the full comparison before it changes anything."""
@@ -76,10 +114,10 @@ def quick_state(conn: sqlite3.Connection, store_dir: Path) -> str:
     count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     if len(tracked) <= count:
         if _line_at(conn, len(tracked) - 1) != tracked[-1]:
-            return DIVERGED
+            return AHEAD if merge_holds_nothing_new(conn, store_dir) else DIVERGED
         return EQUAL if len(tracked) == count else AHEAD
     if count and _line_at(conn, count - 1) != tracked[count - 1]:
-        return DIVERGED
+        return AHEAD if merge_holds_nothing_new(conn, store_dir) else DIVERGED
     return BEHIND
 
 
@@ -90,6 +128,8 @@ def full_state(conn: sqlite3.Connection, store_dir: Path) -> Tuple[str, str]:
         return NO_FILE, f"no {EXPORTS_DIRNAME}/{EVENTS} beside the store"
     store = events_lines(conn)
     state = relation(store, tracked)
+    if state in (DIVERGED, BEHIND) and merge_holds_nothing_new(conn, store_dir):
+        return AHEAD, "a merge is in progress and the store already holds both sides' history"
     if state == EQUAL:
         return state, f"{len(store)} events in both"
     if state == AHEAD:
@@ -163,6 +203,15 @@ def sync(store_dir: Path, *, hot_path: Optional[Path] = None) -> SyncResult:
     equal or ahead store alone."""
     beads = exports_dir(store_dir)
     conflicted = unmerged(store_dir)
+    if conflicted and db_path(store_dir).is_file():
+        conn = open_db(db_path(store_dir))
+        try:
+            shared = merge_holds_nothing_new(conn, store_dir)
+        finally:
+            conn.close()
+        if shared:
+            return SyncResult(AHEAD, "a merge is in progress and the store already holds both "
+                              "sides' history: regenerate the exports from it")
     if conflicted:
         raise StoreError(f"git still has {', '.join(conflicted)} in conflict; resolve the merge "
                          "first (across clones, not by regenerating the files from this store)")

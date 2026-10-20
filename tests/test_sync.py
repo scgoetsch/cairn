@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 from cairn.store import db_path, open_writable
@@ -17,7 +18,9 @@ from .helpers import StoreCase
 FILES = ("issues.jsonl", "memories.jsonl", "allocator.json", "events.jsonl")
 
 
-class SyncTest(StoreCase):
+class SyncCase(StoreCase):
+    """Two clones, a and b, and the helpers; no tests of its own."""
+
     def setUp(self) -> None:
         super().setUp()
         os.environ.pop("BEADS_ACTOR", None)
@@ -59,6 +62,8 @@ class SyncTest(StoreCase):
         self.push(self.a, self.b)
         return issue
 
+
+class SyncTest(SyncCase):
     def test_init_records_the_prefix_for_a_fresh_clone(self):
         config = json.loads((self.a / ".cairn" / "config.json").read_text())
         self.assertEqual(config["prefix"], "t")
@@ -144,3 +149,59 @@ class SyncTest(StoreCase):
         shutil.copyfile(path.with_name("moved.db"), path)
         with self.assertRaises(WriteConflict):
             writer.create("late")
+
+
+class MergeTest(SyncCase):
+    """A merge in the checkout beside the store (workspace-7m8.18 re-measure, 2026-10-20): the
+    working events.jsonl holds both branches' lines, and that alone must not stop writes when
+    the store already has both sides' history (worktrees share one store)."""
+
+    def git(self, clone: Path, *argv: str, check: bool = True) -> subprocess.CompletedProcess:
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        proc = subprocess.run(["git", "-C", str(clone), *argv], capture_output=True, text=True,
+                              env=env)
+        if check:
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc
+
+    def commit_exports(self, clone: Path, message: str) -> None:
+        self.refresh(clone)
+        self.git(clone, "add", ".beads", ".cairn/config.json", ".cairn/.gitignore")
+        self.git(clone, "commit", "-q", "-m", message)
+
+    def test_a_merge_over_one_shared_store_leaves_writes_open(self):
+        self.git(self.a, "init", "-q", "-b", "main")
+        self.w(self.a, "create", "--silent", "--title", "base")
+        self.commit_exports(self.a, "base")
+        self.git(self.a, "branch", "lane")
+        self.w(self.a, "create", "--silent", "--title", "on main")
+        self.commit_exports(self.a, "main")
+        self.git(self.a, "checkout", "-q", "lane")          # same store: it has "on main" too
+        self.w(self.a, "create", "--silent", "--title", "on the lane")
+        self.commit_exports(self.a, "lane")
+        self.git(self.a, "checkout", "-q", "main")
+        merge = self.git(self.a, "merge", "--no-edit", "lane", check=False)
+        self.assertNotEqual(merge.returncode, 0, "expected the exports to conflict")
+        code, out, _ = self.cli("sync", "--status", cwd=self.a)
+        self.assertEqual((code, out.split(":")[0]), (0, "ahead"))
+        self.w(self.a, "create", "--silent", "--title", "written during the merge")
+        self.assertIn("Nothing to do", self.ok(self.a, "sync"))
+
+    def test_a_merge_of_another_clones_history_stays_refused(self):
+        self.git(self.a, "init", "-q", "-b", "main")
+        self.w(self.a, "create", "--silent", "--title", "base")
+        self.commit_exports(self.a, "base")
+        self.git(self.b, "init", "-q", "-b", "main")
+        self.git(self.b, "pull", "-q", str(self.a), "main")
+        self.ok(self.b, "sync")
+        self.w(self.b, "create", "--silent", "--title", "in b")
+        self.commit_exports(self.b, "b")
+        self.w(self.a, "create", "--silent", "--title", "in a")
+        self.commit_exports(self.a, "a")
+        merge = self.git(self.a, "pull", "--no-rebase", "--no-edit", str(self.b), "main", check=False)
+        self.assertNotEqual(merge.returncode, 0, "expected the exports to conflict")
+        code, out, _ = self.cli("sync", "--status", cwd=self.a)
+        self.assertEqual((code, out.split(":")[0]), (2, "diverged"))
+        code, _, err = self.cli("create", "--title", "more", "--actor", "x", cwd=self.a)
+        self.assertEqual(code, 2, err)

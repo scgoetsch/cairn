@@ -548,7 +548,7 @@ def cmd_sync(args, start: Path) -> int:
         else:
             conn = connect_quiet(store)
             state, detail = syncmod.full_state(conn, store)
-        if syncmod.unmerged(store):
+        if syncmod.unmerged(store) and state != syncmod.AHEAD:
             state, detail = syncmod.DIVERGED, "export files unmerged in git"
         if args.json:
             emit_json({"state": state, "detail": detail})
