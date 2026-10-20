@@ -412,6 +412,56 @@ class MemoryTest(WritableCase):
         self.assertEqual(code, 1)
 
 
+class AdmissionTest(WritableCase):
+    """remember carries bd-memgraph's evolve (workspace-7m8.20)."""
+    BODY = ("sov2 scale runs: cairn ready latency stays under one second at thirty "
+            "thousand issues while bd times out under eight workers")
+
+    def test_a_near_duplicate_of_another_key_is_refused_and_names_it(self):
+        self.w("remember", "--key", "scale-results", self.BODY)
+        code, _, err = self.cli("remember", "--key", "scale-again", self.BODY + " today",
+                                "--actor", "x")
+        self.assertEqual(code, 1)
+        self.assertIn("near-duplicate of memory 'scale-results'", err)
+        self.assertIn("cairn recall scale-results", err)
+        code, _, _ = self.cli("recall", "scale-again")
+        self.assertEqual(code, 1)
+
+    def test_force_stores_it_anyway(self):
+        self.w("remember", "--key", "scale-results", self.BODY)
+        self.w("remember", "--key", "scale-again", self.BODY, "--force")
+        _, out, _ = self.cli("recall", "scale-again")
+        self.assertEqual(out.strip(), self.BODY)
+
+    def test_rewriting_the_same_key_is_an_update_not_a_duplicate(self):
+        self.w("remember", "--key", "scale-results", self.BODY)
+        out = self.w("remember", "--key", "scale-results", self.BODY + " (checked twice)")
+        self.assertIn("Updated [scale-results]", out)
+
+    def test_a_body_that_supersedes_the_key_it_resembles_is_admitted(self):
+        self.w("remember", "--key", "scale-results", self.BODY)
+        self.w("remember", "--key", "scale-results-v2",
+               self.BODY + " supersedes::[[scale-results]]")
+
+    def test_a_related_body_without_links_gets_the_keys_to_link(self):
+        self.w("remember", "--key", "scale-results", self.BODY)
+        draft = ("agent sessions on sov2 measured ready latency against a budget of two "
+                 "seconds per verb, reported in the evaluation")
+        code, _, err = self.cli("remember", "--key", "latency-note", draft, "--actor", "x")
+        self.assertEqual(code, 0, err)
+        self.assertIn("[[scale-results]]", err)
+        code, _, err = self.cli("remember", "--key", "latency-note",
+                                draft + " see [[scale-results]]", "--actor", "x")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err.strip(), "")
+
+    def test_a_standalone_body_says_nothing(self):
+        self.w("remember", "--key", "scale-results", self.BODY)
+        code, _, err = self.cli("remember", "--key", "tea", "green tea steeps two minutes",
+                                "--actor", "x")
+        self.assertEqual((code, err.strip()), (0, ""))
+
+
 class TransactionTest(WritableCase):
     def test_a_failing_write_leaves_neither_change_nor_event(self):
         from cairn.store import open_writable

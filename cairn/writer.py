@@ -37,7 +37,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from . import links, timeutil
+from . import admission, links, timeutil
 from .importer import body_hash
 from .queries import BLOCKING_TYPE, PARENT_TYPE, Snapshot
 from .store import STATUSES, get_meta
@@ -550,15 +550,37 @@ class Writer:
             "INSERT INTO memory_edges(source_key, target, relation, target_kind) "
             "VALUES (?, ?, ?, ?)", [(s, t, r, k) for s, r, t, k in edges])
 
-    def remember(self, key: str, value: str) -> bool:
-        """Set a memory. True when the key is new. Replaces silently, as bd does;
-        the event row is the record of what was there."""
+    def remember(self, key: str, value: str, *, force: bool = False) -> Tuple[bool, List[str]]:
+        """Set a memory: (True when the key is new, keys worth linking to).
+
+        Admission control first (admission.py): a body that is a near-duplicate
+        of ANOTHER key is refused unless `force`, since the right write is an
+        update of that key. A key the body supersedes is not a candidate: that is
+        the documented way to replace one. A related body that links to no
+        memory comes back with the keys worth linking to. Rewriting the same key
+        replaces silently, as bd does; the event row is the record of what was
+        there."""
         if not key or not key.strip():
             raise WriteRefused("remember needs --key: keyless memories cannot be found, "
                                "deduplicated or updated")
         if not value:
             raise WriteRefused("an empty memory body")
         with self.transaction() as now:
+            bodies = {r["key"]: r["value"] for r in self.conn.execute(
+                "SELECT key, value FROM memories")}
+            written = links.EDGE_RE.findall(value)
+            superseded = {t for rel, t in written if rel == "supersedes"}
+            scored = admission.score(value, bodies, exclude={key} | superseded)
+            if scored and scored[0][0] >= admission.NEAR_DUPLICATE and not force:
+                other = scored[0][1]
+                raise WriteConflict(
+                    f"near-duplicate of memory '{other}' (overlap {scored[0][0]:.2f}): update "
+                    f"it in place (cairn recall {other}, then cairn remember --key {other} "
+                    f"\"<merged>\"), or write supersedes::[[{other}]] to replace it; "
+                    "--force stores it under this key anyway")
+            related: List[str] = []
+            if not any(t in bodies for _, t in written):
+                related = [k for s, k in scored[:3] if s >= admission.RELATED]
             old = self.conn.execute("SELECT * FROM memories WHERE key = ?", (key,)).fetchone()
             if old is None:
                 self.conn.execute(
@@ -573,7 +595,7 @@ class Writer:
                         {"old_hash": old["body_hash"] if old else None,
                          "new_hash": body_hash(value)}, memory_key=key)
             self._rederive_edges()
-        return old is None
+        return old is None, related
 
     def forget(self, key: str) -> str:
         with self.transaction() as now:

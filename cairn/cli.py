@@ -772,11 +772,16 @@ def cmd_dep(args, start: Path) -> int:
 
 def cmd_remember(args, start: Path) -> int:
     writer = open_writer(args, start)
-    new = writer.remember(args.key or "", args.value)
+    new, related = writer.remember(args.key or "", args.value, force=args.force)
     if args.json:
         emit_json({"key": args.key, "status": "created" if new else "updated"})
     elif not args.quiet:
         print(f"{'Remembered' if new else 'Updated'} [{args.key}]: {args.value[:PREVIEW]}")
+    if related and not args.quiet:
+        links_hint = " ".join(f"[[{k}]]" for k in related)
+        print(f"note: related to {links_hint} but links to no memory; add the link that "
+              "holds (supersedes::, depends-on::, contradicts:: where the relation is causal) "
+              f"with cairn remember --key {args.key}", file=sys.stderr)
     return 0
 
 
@@ -1008,6 +1013,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = writer_parser("remember", "set a memory (--key required)")
     p.add_argument("value")
     p.add_argument("--key")
+    p.add_argument("--force", action="store_true",
+                   help="store a body that is a near-duplicate of another key")
     p.set_defaults(func=cmd_remember)
 
     p = writer_parser("forget", "delete a memory")

@@ -316,6 +316,12 @@ Writes (each pinned in `tests/test_writer.py` or `tests/test_drill.py`):
 - `update`, `close` and the other verbs need an id; bd acts on the issue it
   last touched when none is given.
 - `remember` needs `--key`; bd generates one.
+- `remember` runs admission control (bd-memgraph's `evolve`, folded in): a body
+  that is a near-duplicate of another key (token overlap at least 0.5) is refused,
+  exit 1, naming that key and the update recipe; `--force` stores it anyway, and a
+  key the body `supersedes::` is not a candidate. A related body (0.18 or more)
+  that links to no memory is stored with a note on stderr naming keys to link.
+  Rewriting the same key is never refused. bd stores every body.
 - `delete` without `--force` is refused (exit 2); bd prints a preview and exits
   0. `delete` does not rewrite mentions of the id in other issues' text; bd does.
 - A usage error (no title) exits 2, where bd exits 1.
@@ -356,6 +362,11 @@ memory when it is a memory key; otherwise an issue reference when it has the
 shape of an issue id under the store's prefix or one listed under
 `issue_prefixes` in `.cairn/config.json` (or in `CAIRN_ISSUE_PREFIXES`). `cairn check` reports dangling and self links as errors,
 explains a link to a deleted key, and flags an issue with more than one parent.
+
+Under cairn these replace bd-memgraph: `remember` does its `evolve` (see the
+deliberate differences below), `cairn check` its hard link check, and the
+`created_at` / `updated_at` columns and `memory_tombstones` its ledger. Its
+`rank`, `lineage`, `related` and `graph` have no cairn verb.
 
 ## Known limits
 
