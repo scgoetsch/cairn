@@ -236,7 +236,7 @@ def cmd_blocked(args, start: Path) -> int:
 
 
 def cmd_show(args, start: Path) -> int:
-    snap = Snapshot(connect(start))
+    snap = Snapshot(connect(start), around=[args.id])     # one issue: no whole-store load
     if args.id not in snap.issues:
         print(f'Error fetching {args.id}: no issue found matching "{args.id}"', file=sys.stderr)
         return 1
@@ -518,10 +518,11 @@ def open_writer(args, start: Path, *, claim: bool = False) -> Writer:
 
 def report_issues(args, writer: Writer, ids: Sequence[str], verb: str, extra: str = "",
                   snap: Optional[Snapshot] = None) -> int:
-    """The confirmation lines. Only --json needs a snapshot: the line needs a title, and a
-    snapshot of a 30k-issue store cost a write ten times its own work (workspace-7m8.24)."""
+    """The confirmation lines. Only --json needs a snapshot, scoped to the written issues: the
+    line needs a title, and a snapshot of a 30k-issue store cost a write ten times its own
+    work (workspace-7m8.24)."""
     if args.json:
-        snap = snap or Snapshot(writer.conn)
+        snap = snap or Snapshot(writer.conn, around=ids)
         emit_json([snap.issue_object(i) for i in ids if i in snap.issues])
         return 0
     if getattr(args, "quiet", False):
@@ -703,7 +704,7 @@ def cmd_create(args, start: Path) -> int:
         print(new_id)
         return 0
     if args.json:
-        emit_json(Snapshot(writer.conn).issue_object(new_id))
+        emit_json(Snapshot(writer.conn, around=[new_id]).issue_object(new_id))
         return 0
     if not args.quiet:
         print(f"✓ Created issue: {new_id} — {title}")

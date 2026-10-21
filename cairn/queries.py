@@ -23,7 +23,7 @@ import functools
 import json
 import sqlite3
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from . import timeutil
 
@@ -175,13 +175,54 @@ class SortedOnRead(dict):
         return self[issue_id] if issue_id in self else default
 
 
+def scope_around(conn: sqlite3.Connection, around: Iterable[str]) -> Tuple[Set[str], Set[int]]:
+    """The issue ids and dependency rowids a Snapshot(around=...) loads.
+
+    issue_object(x) reads x's row, labels, comments and edges both ways, and for each
+    neighbour the same again (a neighbour's own edges are only counted, so its neighbours'
+    rows are not needed). blocked() decides x from x's outgoing edges and its blockers'
+    rows, then the same for each parent, up the whole parent-child chain."""
+    def rows(sql: str, *id_sets: Set[str]) -> List[sqlite3.Row]:
+        return conn.execute(sql, [json.dumps(sorted(ids)) for ids in id_sets]).fetchall()
+    within = "IN (SELECT value FROM json_each(?{}))".format
+    focus = set(around)
+    chain, frontier = set(focus), set(focus)
+    while frontier:                           # focus and every ancestor
+        frontier = {r["depends_on_id"] for r in rows(
+            f"SELECT depends_on_id FROM dependencies WHERE type = '{PARENT_TYPE}' "
+            f"AND issue_id {within(1)}", frontier)} - chain
+        chain |= frontier
+    near = rows(f"SELECT issue_id, depends_on_id FROM dependencies "
+                f"WHERE issue_id {within(1)} OR depends_on_id {within(1)}", focus)
+    linked = focus | {r["issue_id"] for r in near} | {r["depends_on_id"] for r in near}
+    edges = rows(f"SELECT rowid, issue_id, depends_on_id FROM dependencies "
+                 f"WHERE issue_id {within(1)} OR depends_on_id {within(2)}",
+                 chain | linked, linked)
+    ids = chain | linked | {r["depends_on_id"] for r in edges if r["issue_id"] in chain}
+    return ids, {r["rowid"] for r in edges}
+
+
 class Snapshot:
     """Everything the read verbs need, loaded once. The store is small (hundreds
     of issues), so computing in Python is simpler to verify than recursive SQL."""
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, around: Optional[Iterable[str]] = None) -> None:
+        """around: load only what issue_object and blocked() read for these issues (their
+        rows, their neighbours' rows and edges, the parent chain above them), not the whole
+        store (workspace-7m8.25). Every answer about one of them is the full snapshot's; an
+        answer about any other issue is not, so read only these through it."""
+        if around is None:
+            issues_sql, deps_sql, scoped_sql, params = (
+                "SELECT * FROM issues", "SELECT * FROM dependencies", "", ())
+        else:
+            ids, edges = scope_around(conn, around)
+            params = (json.dumps(sorted(ids)),)
+            within = "IN (SELECT value FROM json_each(?))"
+            issues_sql = f"SELECT * FROM issues WHERE id {within}"
+            deps_sql = f"SELECT * FROM dependencies WHERE rowid {within} ORDER BY rowid"
+            scoped_sql = f"WHERE issue_id {within}"
         self.issues: Dict[str, sqlite3.Row] = {
-            row["id"]: row for row in conn.execute("SELECT * FROM issues")}
+            row["id"]: row for row in conn.execute(issues_sql, params)}
         meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
         # The order bd lists an issue's dependencies in changed between bd versions
         # (1.1.2: by edge id; 1.3.1: by target id). An import records the source's.
@@ -190,16 +231,21 @@ class Snapshot:
         # By issue only: the order inside one issue's list is bd's (dep_key), and
         # "edge-id" is a uuid5 per edge, the most expensive step of a snapshot at 30k
         # issues (workspace-7m8.24). deps_of and parents_of sort a list when it is read.
+        # In rowid order before the sort, as a full scan reads them: the order of
+        # dependents_of and of blocked()'s pass over parents_of follows it.
         self.deps: List[sqlite3.Row] = sorted(
-            conn.execute("SELECT * FROM dependencies"), key=lambda d: d["issue_id"])
+            conn.execute(deps_sql, (json.dumps(sorted(edges)),) if around is not None else ()),
+            key=lambda d: d["issue_id"])
         learned = meta.get("export_key_order")
         self.export_key_order: Sequence[str] = (
             json.loads(learned) if learned else EXPORT_KEY_ORDER)
         self.labels: Dict[str, List[str]] = {}
-        for row in conn.execute("SELECT issue_id, label FROM labels ORDER BY issue_id, label"):
+        for row in conn.execute(f"SELECT issue_id, label FROM labels {scoped_sql} "
+                                "ORDER BY issue_id, label", params):
             self.labels.setdefault(row["issue_id"], []).append(row["label"])
         self.comments: Dict[str, List[sqlite3.Row]] = {}
-        for row in conn.execute("SELECT * FROM comments ORDER BY issue_id, created_at, id"):
+        for row in conn.execute(f"SELECT * FROM comments {scoped_sql} "
+                                "ORDER BY issue_id, created_at, id", params):
             self.comments.setdefault(row["issue_id"], []).append(row)
 
         self.deps_of: SortedOnRead = SortedOnRead(

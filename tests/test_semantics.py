@@ -198,3 +198,44 @@ class CountsTest(StoreCase):
         self.assertEqual(snap.issue_object("t-b")["dependent_count"], 1)
         self.assertEqual(snap.issue_object("t-p")["dependent_count"], 0)
         self.assertEqual(snap.issue_object("t-c")["parent"], "t-p")
+
+
+class ScopedSnapshotTest(StoreCase):
+    """show reads Snapshot(around=[id]) (workspace-7m8.25): for that issue it must answer
+    exactly as the whole-store snapshot does."""
+
+    def test_every_answer_about_the_focus_matches_the_full_snapshot(self):
+        conn, _ = self.build([
+            issue("t-x"), issue("t-y"), issue("t-done", status="closed"),
+            # a chain: the blocker sits three levels above the leaf
+            with_deps(issue("t-p", issue_type="epic", labels=["l1"]), dep("t-p", "t-x")),
+            child("t-p.1", "t-p"),
+            child("t-p.1.1", "t-p.1"),
+            # two parents, both blocked through their own parents
+            with_deps(issue("t-q", issue_type="epic"), dep("t-q", "t-y")),
+            child("t-q.1", "t-q"),
+            with_deps(issue("t-two"), dep("t-two", "t-p.1", "parent-child"),
+                      dep("t-two", "t-q.1", "parent-child")),
+            # own blocker wins over the blocked parent; a closed child; noise edges
+            with_deps(issue("t-p.2"), dep("t-p.2", "t-p", "parent-child"), dep("t-p.2", "t-y")),
+            child("t-p.3", "t-p", status="closed"),
+            with_deps(issue("t-r"), dep("t-r", "t-p.1.1", "related"),
+                      dep("t-r", "t-done"), dep("t-r", "t-gone")),
+        ])
+        full = Snapshot(conn)
+        self.assertEqual(full.blocked()["t-two"], ["t-p.1", "t-q.1"])   # the case is live
+        for issue_id in list(full.issues) + ["t-gone"]:
+            scoped = Snapshot(conn, around=[issue_id])
+            with self.subTest(issue_id):
+                self.assertEqual(issue_id in scoped.issues, issue_id in full.issues)
+                if issue_id not in full.issues:
+                    continue
+                self.assertEqual(scoped.issue_object(issue_id, shape="show"),
+                                 full.issue_object(issue_id, shape="show"))
+                self.assertEqual(scoped.issue_object(issue_id), full.issue_object(issue_id))
+                self.assertEqual(scoped.blocked().get(issue_id), full.blocked().get(issue_id))
+
+    def test_it_loads_the_neighbourhood_not_the_store(self):
+        conn, _ = self.build([issue(f"t-{n}") for n in range(50)]
+                             + [with_deps(issue("t-a"), dep("t-a", "t-1"))])
+        self.assertEqual(set(Snapshot(conn, around=["t-a"]).issues), {"t-a", "t-1"})
