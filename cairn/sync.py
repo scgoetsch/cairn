@@ -51,6 +51,38 @@ def file_lines(path: Path) -> List[str]:
     return [line for line in path.read_text(encoding="utf-8").split("\n") if line]
 
 
+def count_and_last_line(path: Path) -> Optional[Tuple[int, str]]:
+    """(lines, last line) of `path` as file_lines counts them, read in chunks plus the tail,
+    without decoding the file: every verb asks, and a 30k-issue history is 26 MB, which took
+    file_lines 44 ms (workspace-7m8.24). None when the file has a blank line: file_lines
+    skips those, so the caller reads it whole."""
+    if not path.is_file():
+        return 0, ""
+    count, prev, size = 0, b"\n", 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            if b"\n\n" in prev[-1:] + chunk:
+                return None
+            count += chunk.count(b"\n")
+            prev, size = chunk, size + len(chunk)
+        if size == 0:
+            return 0, ""
+        if not prev.endswith(b"\n"):
+            count += 1                        # a last line without its newline
+        tail = b""
+        while True:
+            start = max(0, size - len(tail) - (1 << 16))
+            f.seek(start)
+            tail = f.read(size - start)
+            body = tail.rstrip(b"\n")
+            cut = body.rfind(b"\n")
+            if cut >= 0 or start == 0:
+                return count, body[cut + 1:].decode("utf-8")
+
+
 def relation(store: List[str], tracked: List[str]) -> str:
     if store == tracked:
         return EQUAL
@@ -108,15 +140,20 @@ def merge_holds_nothing_new(conn: sqlite3.Connection, store_dir: Path) -> bool:
 def quick_state(conn: sqlite3.Connection, store_dir: Path) -> str:
     """The relation, from the line where the two meet only (every verb runs this, so it reads
     one store row, not the history). `sync` runs the full comparison before it changes anything."""
-    tracked = file_lines(exports_dir(store_dir) / EVENTS)
+    path = exports_dir(store_dir) / EVENTS
+    counted = count_and_last_line(path)
+    if counted is None:
+        lines = file_lines(path)
+        counted = (len(lines), lines[-1] if lines else "")
+    tracked, last = counted
     if not tracked:
         return NO_FILE
     count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    if len(tracked) <= count:
-        if _line_at(conn, len(tracked) - 1) != tracked[-1]:
+    if tracked <= count:
+        if _line_at(conn, tracked - 1) != last:
             return AHEAD if merge_holds_nothing_new(conn, store_dir) else DIVERGED
-        return EQUAL if len(tracked) == count else AHEAD
-    if count and _line_at(conn, count - 1) != tracked[count - 1]:
+        return EQUAL if tracked == count else AHEAD
+    if count and _line_at(conn, count - 1) != file_lines(path)[count - 1]:
         return AHEAD if merge_holds_nothing_new(conn, store_dir) else DIVERGED
     return BEHIND
 

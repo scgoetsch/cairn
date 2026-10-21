@@ -516,15 +516,23 @@ def open_writer(args, start: Path, *, claim: bool = False) -> Writer:
                   db_file=db_path(store))
 
 
-def report_issues(args, writer: Writer, ids: Sequence[str], verb: str, extra: str = "") -> int:
-    snap = Snapshot(writer.conn)
+def report_issues(args, writer: Writer, ids: Sequence[str], verb: str, extra: str = "",
+                  snap: Optional[Snapshot] = None) -> int:
+    """The confirmation lines. Only --json needs a snapshot: the line needs a title, and a
+    snapshot of a 30k-issue store cost a write ten times its own work (workspace-7m8.24)."""
     if args.json:
+        snap = snap or Snapshot(writer.conn)
         emit_json([snap.issue_object(i) for i in ids if i in snap.issues])
         return 0
     if getattr(args, "quiet", False):
         return 0
     for issue_id in ids:
-        title = snap.issues[issue_id]["title"] if issue_id in snap.issues else ""
+        if snap is not None:
+            row = snap.issues.get(issue_id)
+        else:
+            row = writer.conn.execute("SELECT title FROM issues WHERE id = ?",
+                                      (issue_id,)).fetchone()
+        title = row["title"] if row is not None else ""
         print(f"✓ {verb} {issue_id} — {title}{extra}")
     return 0
 
@@ -722,9 +730,9 @@ def cmd_close(args, start: Path) -> int:
     for issue_id in args.ids:
         if issue_id not in closed and not args.json:
             print(f"{issue_id} was already closed; unchanged")
-    code = report_issues(args, writer, closed, "Closed", f": {args.reason or 'Closed'}")
-    if args.suggest_next and not args.json:
-        snap = Snapshot(writer.conn)
+    snap = Snapshot(writer.conn) if args.suggest_next and not args.json else None
+    code = report_issues(args, writer, closed, "Closed", f": {args.reason or 'Closed'}", snap)
+    if snap is not None:
         newly = [i for i in snap.ready(now=timeutil.now_iso()) if i not in before]
         for issue_id in newly:
             print(f"  now ready: {issue_line(snap, issue_id)}")

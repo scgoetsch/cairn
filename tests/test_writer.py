@@ -10,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
+from unittest import mock
 
 from cairn.queries import Snapshot
 from cairn.store import db_path, open_db
@@ -373,6 +374,43 @@ class DependencyTest(WritableCase):
         code, _, _ = self.cli("delete", a, "--actor", "x")
         self.assertEqual(code, 2)
         self.assertIn(a, self.snap().issues)
+
+
+class ConfirmationTest(WritableCase):
+    def test_lines_name_the_issue_by_title(self):
+        a, b = self.new("first"), self.new("second")
+        self.assertEqual(self.w("update", a, "--notes", "x"), f"✓ Updated issue: {a} — first")
+        self.assertEqual(self.w("note", a, "hi"), f"✓ Note added to {a} — first")
+        self.assertEqual(self.w("close", a, b, "-r", "done"),
+                         f"✓ Closed {a} — first: done\n✓ Closed {b} — second: done")
+        self.assertEqual(self.w("reopen", a), f"✓ Reopened {a} — first")
+        self.assertEqual(self.w("close", a, "-q"), "")
+
+    def test_a_write_builds_no_snapshot_unless_json_asks_for_one(self):
+        # At 30k issues a snapshot cost a close ten times its own work (workspace-7m8.24).
+        a = self.new("first")
+        with mock.patch("cairn.cli.Snapshot", side_effect=AssertionError("snapshot built")):
+            self.w("update", a, "--notes", "x")
+            self.w("note", a, "hi")
+            self.w("close", a)
+            self.w("reopen", a)
+        _, out, _ = self.cli("update", a, "--notes", "y", "--json", "--actor", "alice")
+        self.assertEqual(json.loads(out)[0]["notes"], "y")
+
+    def test_suggest_next_lists_only_what_the_close_made_ready(self):
+        blocker = self.new("blocker")
+        work = self.new("work")
+        epic = self.new("epic", "-t", "epic")
+        kid = self.new("kid", "--parent", epic)
+        already = self.new("already ready")
+        self.w("dep", "add", work, blocker)
+        self.w("dep", "add", epic, blocker)
+        out = self.w("close", blocker, "--suggest-next").splitlines()
+        self.assertEqual(out[0], f"✓ Closed {blocker} — blocker: Closed")
+        surfaced = sorted(line.split()[3] for line in out[1:])
+        self.assertTrue(all(line.startswith("  now ready: ○ ") for line in out[1:]), out)
+        self.assertEqual(surfaced, sorted([work, epic, kid]))
+        self.assertNotIn(already, surfaced)
 
 
 class MemoryTest(WritableCase):

@@ -19,6 +19,7 @@ store (2026-09-30) rather than assumed:
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
 import uuid
@@ -85,6 +86,7 @@ DEFAULT_DEP_ORDER = "edge-id"
 def export_lines(conn: sqlite3.Connection, include_memories: bool) -> List[str]:
     """The export, one JSON line per row: issues, then memories."""
     snap = Snapshot(conn)
+    snap.deps_of.sort_all()
     lines = [go_json(snap.issue_object(row["id"], shape="export"))
              for row in sorted(snap.issues.values(), key=export_order)]
     if include_memories:
@@ -146,6 +148,33 @@ def go_json(obj: Any) -> str:
     return text
 
 
+class SortedOnRead(dict):
+    """issue id -> list, each list sorted by key(issue id, item) the first time `get` or
+    `[]` reads it. Iterating items() or values() gives lists in insertion order."""
+
+    def __init__(self, key) -> None:
+        super().__init__()
+        self._key = key
+        self._sorted: Set[str] = set()
+
+    def __getitem__(self, issue_id: str) -> List[Any]:
+        items = super().__getitem__(issue_id)
+        if issue_id not in self._sorted:
+            items.sort(key=functools.partial(self._key, issue_id))
+            self._sorted.add(issue_id)
+        return items
+
+    def sort_all(self) -> None:
+        """For a caller about to read every list (export): one pass, no per-read checks."""
+        for issue_id, items in self.items():
+            if issue_id not in self._sorted:
+                items.sort(key=functools.partial(self._key, issue_id))
+        self._sorted.update(self.keys())
+
+    def get(self, issue_id: str, default: Any = None) -> Any:
+        return self[issue_id] if issue_id in self else default
+
+
 class Snapshot:
     """Everything the read verbs need, loaded once. The store is small (hundreds
     of issues), so computing in Python is simpler to verify than recursive SQL."""
@@ -158,9 +187,11 @@ class Snapshot:
         # (1.1.2: by edge id; 1.3.1: by target id). An import records the source's.
         dep_key = DEP_ORDERS.get(meta.get("dep_order") or DEFAULT_DEP_ORDER,
                                  DEP_ORDERS[DEFAULT_DEP_ORDER])
+        # By issue only: the order inside one issue's list is bd's (dep_key), and
+        # "edge-id" is a uuid5 per edge, the most expensive step of a snapshot at 30k
+        # issues (workspace-7m8.24). deps_of and parents_of sort a list when it is read.
         self.deps: List[sqlite3.Row] = sorted(
-            conn.execute("SELECT * FROM dependencies"),
-            key=lambda d: (d["issue_id"], dep_key(d["issue_id"], d["depends_on_id"])))
+            conn.execute("SELECT * FROM dependencies"), key=lambda d: d["issue_id"])
         learned = meta.get("export_key_order")
         self.export_key_order: Sequence[str] = (
             json.loads(learned) if learned else EXPORT_KEY_ORDER)
@@ -171,9 +202,12 @@ class Snapshot:
         for row in conn.execute("SELECT * FROM comments ORDER BY issue_id, created_at, id"):
             self.comments.setdefault(row["issue_id"], []).append(row)
 
-        self.deps_of: Dict[str, List[sqlite3.Row]] = {}
+        self.deps_of: SortedOnRead = SortedOnRead(
+            lambda issue_id, d: dep_key(issue_id, d["depends_on_id"]))
+        # Same order as a sort by (issue_id, dep_key): dep_key is one value per
+        # (issue, target) pair, so it never reorders the edges into one target.
         self.dependents_of: Dict[str, List[sqlite3.Row]] = {}
-        self.parents_of: Dict[str, List[str]] = {}
+        self.parents_of: SortedOnRead = SortedOnRead(dep_key)
         self.children_of: Dict[str, List[str]] = {}
         for dep in self.deps:
             self.deps_of.setdefault(dep["issue_id"], []).append(dep)
@@ -212,7 +246,9 @@ class Snapshot:
                 if via:
                     blocked[child] = via
                     changed = True
-        self._blocked = {k: sorted(v) for k, v in blocked.items()}
+        # Sorted when one is read: ready and show only test membership (workspace-7m8.24).
+        self._blocked = SortedOnRead(lambda issue_id, blocker: blocker)
+        self._blocked.update(blocked)
         return self._blocked
 
     # -- selection --------------------------------------------------------

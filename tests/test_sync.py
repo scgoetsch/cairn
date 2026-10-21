@@ -10,6 +10,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from cairn import sync as syncmod
 from cairn.store import db_path, open_writable
 from cairn.writer import WriteConflict, Writer
 
@@ -205,3 +206,30 @@ class MergeTest(SyncCase):
         self.assertEqual((code, out.split(":")[0]), (2, "diverged"))
         code, _, err = self.cli("create", "--title", "more", "--actor", "x", cwd=self.a)
         self.assertEqual(code, 2, err)
+
+
+class LineCountTest(StoreCase):
+    """quick_state counts the tracked history without decoding it (workspace-7m8.24); the
+    count and the last line must be file_lines' own."""
+
+    def test_agrees_with_file_lines(self):
+        long_line = "x" * 70_000                    # longer than one tail read
+        at_chunk = "a" * ((1 << 20) - 1)            # its newline is the chunk's last byte
+        cases = {
+            "missing": None, "empty": "", "one": "a\n", "unterminated": "a\nb",
+            "trailing blank lines": "a\nb\n\n\n", "blank inside": "a\n\nb\n",
+            "leading newline": "\na\n", "long last line": f"a\n{long_line}\n",
+            "only a long line": long_line, "blank across a chunk": f"{at_chunk}\n\nb\n",
+            "line across a chunk": f"{at_chunk}b\nc\n", "unicode": "é\n€\n",
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                path = self.workspace / f"{name}.jsonl"
+                if text is not None:
+                    path.write_text(text, encoding="utf-8")
+                lines = syncmod.file_lines(path)
+                got = syncmod.count_and_last_line(path)
+                if got is None:
+                    self.assertIn("\n\n", "\n" + (text or ""), "only blank lines force a full read")
+                else:
+                    self.assertEqual(got, (len(lines), lines[-1] if lines else ""))
