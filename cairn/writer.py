@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from . import admission, links, timeutil
-from .importer import body_hash
+from .importer import ISSUE_COLUMNS, body_hash
 from .queries import BLOCKING_TYPE, PARENT_TYPE, Snapshot
 from .store import STATUSES, get_meta
 
@@ -51,6 +51,8 @@ DEP_TYPES = (BLOCKING_TYPE, PARENT_TYPE, "related", "discovered-from")
 FIELD_COLUMNS = ("title", "description", "design", "acceptance_criteria", "notes",
                  "priority", "issue_type", "assignee", "status", "defer_until")
 DEFAULT_CLOSE_REASON = "Closed"
+# What _set may write: every issue column but the key and the timestamp _set itself moves.
+_SETTABLE = frozenset(ISSUE_COLUMNS) - {"id", "updated_at"}
 
 
 class WriteRefused(Exception):
@@ -155,11 +157,15 @@ class Writer:
              reason: Optional[str] = None) -> Dict[str, Any]:
         """Apply column changes; one field_change event per column that changed
         (bd's audit vocabulary). updated_at moves only when something changed."""
+        # Column names cannot be bound as parameters, so they are checked against the schema's.
+        unknown = sorted(set(changes) - _SETTABLE - {"updated_at"})
+        if unknown:
+            raise ValueError(f"not a settable issue column: {unknown}")
         changed = {k: v for k, v in changes.items() if k != "updated_at" and row[k] != v}
         if not changed:
             return {}
         sets = ", ".join(f"{k} = ?" for k in changed)
-        self.conn.execute(f"UPDATE issues SET {sets}, updated_at = ? WHERE id = ?",
+        self.conn.execute(f"UPDATE issues SET {sets}, updated_at = ? WHERE id = ?",  # noqa: S608 — names checked against _SETTABLE, values bound
                           (*changed.values(), now, row["id"]))
         for col, new in changed.items():
             data = {"field": col, "old_value": row[col], "new_value": new}

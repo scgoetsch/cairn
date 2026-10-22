@@ -1156,7 +1156,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (OSError, sqlite3.Error) as exc:
         print(f"{PROG}: error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
-    except Exception as exc:        # noqa: BLE001 — see the exit-code note at the top
+    except Exception as exc:        # broad on purpose: see the exit-code note at the top
         if os.environ.get("CAIRN_DEBUG"):
             raise
         print(f"{PROG}: internal error: {type(exc).__name__}: {exc} "

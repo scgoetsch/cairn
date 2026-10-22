@@ -126,7 +126,7 @@ def _insert_issue(conn: sqlite3.Connection, row: Dict[str, Any], where: str) -> 
     values.append(json.dumps(extra, sort_keys=True) if extra else None)
     try:
         conn.execute(
-            f"INSERT INTO issues ({', '.join(ISSUE_COLUMNS)}, extra) "
+            f"INSERT INTO issues ({', '.join(ISSUE_COLUMNS)}, extra) "  # noqa: S608 — ISSUE_COLUMNS is a constant, values bound
             f"VALUES ({', '.join('?' * (len(ISSUE_COLUMNS) + 1))})", values)
     except sqlite3.IntegrityError as exc:
         raise SourceError(f"{where}: {exc}") from exc

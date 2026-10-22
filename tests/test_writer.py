@@ -524,6 +524,20 @@ class TransactionTest(WritableCase):
             writer.update(issue_id, title="changed")
         self.assertEqual(self.row(issue_id)["title"], "x")
 
+    def test_set_refuses_a_column_name_outside_the_schema(self):
+        from cairn.store import open_writable
+        from cairn.writer import Writer
+        issue_id = self.new("x")
+        conn = open_writable(db_path(self.store_dir))
+        self.addCleanup(conn.close)
+        writer = Writer(conn, actor="a")
+        for bad in ("title = 'pwned', status", "id"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                with writer.transaction() as now:
+                    writer._set(now, writer._issue(issue_id), {bad: "v"})
+        self.assertEqual((self.row(issue_id)["title"], issue_id), ("x", self.row(issue_id)["id"]))
+        self.assertEqual([e["kind"] for e in self.events(issue_id)], ["created"])
+
     def test_events_stay_append_only(self):
         import sqlite3
         from cairn.store import open_writable

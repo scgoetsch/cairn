@@ -459,8 +459,12 @@ enables the pre-commit gate (`dev/ruff-gate.py`, needs `ruff` on PATH; it passes
 and says so without it). It refuses a commit that adds a broad `except`, an
 undefined name, a `requests` call without a timeout, SQL built from strings,
 `shell=True`, `eval`/`exec`, `pickle` or `yaml.load` on a line the commit adds,
-and leaves findings already in a file alone. Development only; cairn itself
-stays stdlib.
+and leaves findings already in a file alone. It also refuses a new `# noqa` for one of
+those rules that no longer suppresses anything. A false positive gets
+`# noqa: <code> — <why>` on the line ruff reports (the first line of a split
+string). Column and table names cannot be bound as SQL parameters, so the code
+that interpolates them checks them against a fixed set (`writer._set`,
+`queries.COUNTED_TABLES`). Development only; cairn itself stays stdlib.
 
 ## Licence
 

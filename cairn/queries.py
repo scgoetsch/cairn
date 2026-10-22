@@ -29,6 +29,7 @@ from . import timeutil
 
 BLOCKING_TYPE = "blocks"
 PARENT_TYPE = "parent-child"
+COUNTED_TABLES = ("comments", "events", "memories", "memory_edges")
 
 # Key order of an issue object, as bd writes it.
 ISSUE_KEY_ORDER = (
@@ -189,13 +190,13 @@ def scope_around(conn: sqlite3.Connection, around: Iterable[str]) -> Tuple[Set[s
     chain, frontier = set(focus), set(focus)
     while frontier:                           # focus and every ancestor
         frontier = {r["depends_on_id"] for r in rows(
-            f"SELECT depends_on_id FROM dependencies WHERE type = '{PARENT_TYPE}' "
+            f"SELECT depends_on_id FROM dependencies WHERE type = '{PARENT_TYPE}' "  # noqa: S608 — constants only, ids bound
             f"AND issue_id {within(1)}", frontier)} - chain
         chain |= frontier
-    near = rows(f"SELECT issue_id, depends_on_id FROM dependencies "
+    near = rows(f"SELECT issue_id, depends_on_id FROM dependencies "  # noqa: S608 — constants only, ids bound
                 f"WHERE issue_id {within(1)} OR depends_on_id {within(1)}", focus)
     linked = focus | {r["issue_id"] for r in near} | {r["depends_on_id"] for r in near}
-    edges = rows(f"SELECT rowid, issue_id, depends_on_id FROM dependencies "
+    edges = rows(f"SELECT rowid, issue_id, depends_on_id FROM dependencies "  # noqa: S608 — constants only, ids bound
                  f"WHERE issue_id {within(1)} OR depends_on_id {within(2)}",
                  chain | linked, linked)
     ids = chain | linked | {r["depends_on_id"] for r in edges if r["issue_id"] in chain}
@@ -218,8 +219,8 @@ class Snapshot:
             ids, edges = scope_around(conn, around)
             params = (json.dumps(sorted(ids)),)
             within = "IN (SELECT value FROM json_each(?))"
-            issues_sql = f"SELECT * FROM issues WHERE id {within}"
-            deps_sql = f"SELECT * FROM dependencies WHERE rowid {within} ORDER BY rowid"
+            issues_sql = f"SELECT * FROM issues WHERE id {within}"  # noqa: S608 — constant fragment, ids bound
+            deps_sql = f"SELECT * FROM dependencies WHERE rowid {within} ORDER BY rowid"  # noqa: S608 — constant fragment, ids bound
             scoped_sql = f"WHERE issue_id {within}"
         self.issues: Dict[str, sqlite3.Row] = {
             row["id"]: row for row in conn.execute(issues_sql, params)}
@@ -240,11 +241,11 @@ class Snapshot:
         self.export_key_order: Sequence[str] = (
             json.loads(learned) if learned else EXPORT_KEY_ORDER)
         self.labels: Dict[str, List[str]] = {}
-        for row in conn.execute(f"SELECT issue_id, label FROM labels {scoped_sql} "
+        for row in conn.execute(f"SELECT issue_id, label FROM labels {scoped_sql} "  # noqa: S608 — constant fragment, ids bound
                                 "ORDER BY issue_id, label", params):
             self.labels.setdefault(row["issue_id"], []).append(row["label"])
         self.comments: Dict[str, List[sqlite3.Row]] = {}
-        for row in conn.execute(f"SELECT * FROM comments {scoped_sql} "
+        for row in conn.execute(f"SELECT * FROM comments {scoped_sql} "  # noqa: S608 — constant fragment, ids bound
                                 "ORDER BY issue_id, created_at, id", params):
             self.comments.setdefault(row["issue_id"], []).append(row)
 
@@ -574,14 +575,13 @@ def stats(conn: sqlite3.Connection) -> Dict[str, Any]:
     by_status: Dict[str, int] = {}
     for row in snap.issues.values():
         by_status[row["status"]] = by_status.get(row["status"], 0) + 1
-    count = lambda table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    # Table names cannot be bound as parameters; these come from the tuple, never from input.
+    counts = {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608 — names from COUNTED_TABLES
+              for table in COUNTED_TABLES}
     return {
         "issues": len(snap.issues),
         "by_status": dict(sorted(by_status.items())),
         "blocked": len(snap.blocked()),
         "dependencies": len(snap.deps),
-        "comments": count("comments"),
-        "events": count("events"),
-        "memories": count("memories"),
-        "memory_edges": count("memory_edges"),
+        **counts,
     }

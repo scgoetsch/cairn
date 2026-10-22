@@ -27,6 +27,10 @@ import sys
 from collections import Counter
 
 RULES = "BLE001,F821,S102,S113,S301,S307,S506,S602,S604,S605,S608"
+# Also refused when new: a suppression of a gated rule that suppresses nothing (it outlived the
+# code it was written for). Not part of RULES, which the weekly sweep reads as the debt classes.
+# RUF100's "non-enabled" findings (a noqa naming a rule this gate does not select) are dropped.
+HYGIENE = "RUF100"
 
 
 def git(*args, check=True):
@@ -47,12 +51,12 @@ def is_python_script(path):
 
 def findings(path, text):
     proc = subprocess.run(
-        ["ruff", "check", "--isolated", "--select", RULES, "--output-format", "json",
+        ["ruff", "check", "--isolated", "--select", f"{RULES},{HYGIENE}", "--output-format", "json",
          "--stdin-filename", path, "-"],
         input=text, capture_output=True, text=True)
     if proc.returncode not in (0, 1):
         raise RuntimeError(f"ruff failed on {path}: {proc.stderr.strip()}")
-    return json.loads(proc.stdout or "[]")
+    return [f for f in json.loads(proc.stdout or "[]") if "non-enabled" not in f["message"]]
 
 
 def added_lines(path):

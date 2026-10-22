@@ -94,7 +94,7 @@ def relation(store: List[str], tracked: List[str]) -> str:
 
 
 def _line_at(conn: sqlite3.Connection, index: int) -> Optional[str]:
-    row = conn.execute(f"SELECT {EVENT_COLUMNS} FROM events ORDER BY rowid LIMIT 1 OFFSET ?",
+    row = conn.execute(f"SELECT {EVENT_COLUMNS} FROM events ORDER BY rowid LIMIT 1 OFFSET ?",  # noqa: S608 — EVENT_COLUMNS is a constant, offset bound
                        (index,)).fetchone()
     return None if row is None else go_json(event_object(row))
 
