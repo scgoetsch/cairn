@@ -1,0 +1,7 @@
+#!/bin/sh
+# Refuses NEW broad-except / undefined-name / no-timeout / SQL-string / shell=True findings in
+# staged Python, not the backlog. Rule list and logic: dev/ruff-gate.py. Needs ruff on PATH
+# (pipx install ruff); without it the gate says so and passes. Enable once per clone:
+#   git config core.hooksPath .githooks
+# Bypass once with: RUFF_GATE_SKIP=1 git commit ...
+exec python3 -I dev/ruff-gate.py

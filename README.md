@@ -451,6 +451,17 @@ replays bd write commands harvested from agent transcripts (a JSON list of
 `{"argv": [...], "ts": ...}`; transcripts are private, so no corpus ships)
 against both stores and reports every exit code and field that differs.
 
+```bash
+git config core.hooksPath .githooks
+```
+
+enables the pre-commit gate (`dev/ruff-gate.py`, needs `ruff` on PATH; it passes
+and says so without it). It refuses a commit that adds a broad `except`, an
+undefined name, a `requests` call without a timeout, SQL built from strings,
+`shell=True`, `eval`/`exec`, `pickle` or `yaml.load` on a line the commit adds,
+and leaves findings already in a file alone. Development only; cairn itself
+stays stdlib.
+
 ## Licence
 
 MIT — see `LICENSE`.
