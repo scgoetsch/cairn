@@ -1,0 +1,2 @@
+# The width the code is written at. dev/ruff-gate.py selects its own rules and ignores this.
+line-length = 110

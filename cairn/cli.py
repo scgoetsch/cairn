@@ -870,7 +870,9 @@ def cmd_forget(args, start: Path) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog=PROG, description="Agent-facing work and memory store: a read-only shadow of bd, or a writable store of its own (cairn init).")
+        prog=PROG,
+        description="Agent-facing work and memory store: a read-only shadow of bd, "
+                    "or a writable store of its own (cairn init).")
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
     parser.add_argument("-C", "--directory", help="run as if started in this directory")
     parser.add_argument("--json", action="store_true", help="print JSON")

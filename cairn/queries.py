@@ -570,14 +570,19 @@ def check(conn: sqlite3.Connection) -> Dict[str, List[str]]:
     return {"errors": errors, "warnings": warnings, "notes": notes}
 
 
+def _count(conn: sqlite3.Connection, table: str) -> int:
+    # Table names cannot be bound as parameters, so the name is checked here, not by the caller.
+    if table not in COUNTED_TABLES:
+        raise ValueError(f"not a counted table: {table!r}")
+    return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608 — name checked against COUNTED_TABLES
+
+
 def stats(conn: sqlite3.Connection) -> Dict[str, Any]:
     snap = Snapshot(conn)
     by_status: Dict[str, int] = {}
     for row in snap.issues.values():
         by_status[row["status"]] = by_status.get(row["status"], 0) + 1
-    # Table names cannot be bound as parameters; these come from the tuple, never from input.
-    counts = {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608 — names from COUNTED_TABLES
-              for table in COUNTED_TABLES}
+    counts = {table: _count(conn, table) for table in COUNTED_TABLES}
     return {
         "issues": len(snap.issues),
         "by_status": dict(sorted(by_status.items())),

@@ -198,3 +198,12 @@ class HistoryTest(StoreCase):
         self.addCleanup(conn.close)
         with self.assertRaises(sqlite3.OperationalError):
             conn.execute("UPDATE issues SET title = 'changed'")
+
+
+class StatsTest(StoreCase):
+    def test_count_refuses_a_table_outside_the_allowlist(self):
+        from cairn.queries import _count
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        with self.assertRaises(ValueError):
+            _count(conn, "issues; DROP TABLE issues")
