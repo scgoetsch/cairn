@@ -37,7 +37,7 @@ cairn shadow status      # progress against the exit criteria
 
 cairn ready [--json] [-n N] [-p P1] [-t bug] [--parent ID] [--include-deferred]
 cairn list  [--status=in_progress] [--all] [--json] [-n N]
-cairn blocked | show ID | stats | where | check
+cairn blocked | show ID... | stats | where | check
 cairn memories [keyword] | recall KEY
 cairn prime [--budget BYTES]         # default 10000: what Claude Code shows of a hook in full
 cairn export [--include-memories | --all | --allocator | --events] [-o FILE]
@@ -213,7 +213,9 @@ says so on stderr — the JSON on stdout keeps bd's shape.
 
 Exit codes: **0** ok; **1** not found, differences, or `check` errors; **2**
 refused, bad arguments, or could not run. An internal error is reported as 2,
-never as 1, so a crash cannot be read as "differences found".
+never as 1, so a crash cannot be read as "differences found". **141**, with
+nothing on stderr, when the reader of stdout went away (`cairn list | head`), as
+bd and any process killed by SIGPIPE.
 
 The store is found by walking up from the working directory to a `.cairn/`
 directory (not stopping at a nested git repository), or from `CAIRN_DIR`. bd is

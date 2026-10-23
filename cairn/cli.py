@@ -5,7 +5,8 @@ bd is that store's only writer.
 
 Exit codes: 0 ok; 1 not found, differences, or `check` errors; 2 refused, bad
 arguments, or could not run. A crash is reported as 2 — never as 1, which a
-caller would read as "differences found".
+caller would read as "differences found". 141 when the reader of stdout went
+away (`| head`), quietly, as bd and any process killed by SIGPIPE.
 """
 
 from __future__ import annotations
@@ -235,17 +236,36 @@ def cmd_blocked(args, start: Path) -> int:
     return 0
 
 
+SHOW_RULE = "─" * 60    # bd's line between issues in `show A B`
+
+
 def cmd_show(args, start: Path) -> int:
-    snap = Snapshot(connect(start), around=[args.id])     # one issue: no whole-store load
-    if args.id not in snap.issues:
-        print(f'Error fetching {args.id}: no issue found matching "{args.id}"', file=sys.stderr)
+    # Several ids as bd 1.1.2 takes them (measured): a missing one is reported and skipped, the
+    # exit is 1 only when none was found, and --json is one array of the issues found.
+    snap = Snapshot(connect(start), around=args.ids)      # only these issues: no whole-store load
+    found = []
+    for issue_id in args.ids:
+        if issue_id in snap.issues:
+            found.append(issue_id)
+        else:
+            print(f'Error fetching {issue_id}: no issue found matching "{issue_id}"',
+                  file=sys.stderr)
+    if not found:
         return 1
-    obj = snap.issue_object(args.id, shape="show")
+    objs = {issue_id: snap.issue_object(issue_id, shape="show") for issue_id in found}
     if args.json:
-        emit_json([obj])
+        emit_json([objs[issue_id] for issue_id in found])
         return 0
-    row = snap.issues[args.id]
-    print(f"{GLYPH[row['status']]} {args.id} · {row['title']}   "
+    for n, issue_id in enumerate(found):
+        if n:
+            print(f"\n{SHOW_RULE}\n")
+        print_issue(snap, issue_id, objs[issue_id])
+    return 0
+
+
+def print_issue(snap: Snapshot, issue_id: str, obj: Dict[str, Any]) -> None:
+    row = snap.issues[issue_id]
+    print(f"{GLYPH[row['status']]} {issue_id} · {row['title']}   "
           f"[P{row['priority']} · {row['status'].upper()}]")
     people = [f"Owner: {row['owner']}" if row["owner"] else "",
               f"Assignee: {row['assignee']}" if row["assignee"] else "",
@@ -263,7 +283,7 @@ def cmd_show(args, start: Path) -> int:
             print(f"\n{heading}\n")
             for line in row[col].splitlines():
                 print(f"  {line}")
-    blocked_by = snap.blocked().get(args.id)
+    blocked_by = snap.blocked().get(issue_id)
     if blocked_by:
         print(f"\nBLOCKED BY\n  {', '.join(blocked_by)}")
     for heading, key in (("DEPENDS ON", "dependencies"), ("DEPENDENTS", "dependents")):
@@ -276,7 +296,6 @@ def cmd_show(args, start: Path) -> int:
         print(f"\nCOMMENT {comment['created_at'][:10]} {comment['author'] or ''}\n")
         for line in comment["text"].splitlines():
             print(f"  {line}")
-    return 0
 
 
 def cmd_memories(args, start: Path) -> int:
@@ -919,8 +938,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("blocked", help="blocked issues and what blocks them").set_defaults(
         func=cmd_blocked)
 
-    p = sub.add_parser("show", help="one issue in full")
-    p.add_argument("id")
+    p = sub.add_parser("show", help="issues in full")
+    p.add_argument("ids", nargs="+", metavar="id")
     p.set_defaults(func=cmd_show)
 
     p = sub.add_parser("memories", help="list or search memories")
@@ -1146,7 +1165,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (ValueError, OSError):            # not the main thread
         pass
     try:
-        return args.func(args, start)
+        code = args.func(args, start)
+        sys.stdout.flush()      # a reader that went away surfaces here, not at interpreter exit
+        return code
     except (StoreError, SourceError, shadow.BdError, Refused, WriteRefused) as exc:
         print(f"{PROG}: error: {exc}", file=sys.stderr)
         return 2
@@ -1154,7 +1175,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"{PROG}: {exc}", file=sys.stderr)
         return 1
     except BrokenPipeError:
-        return 0
+        # The reader closed the pipe (`| head`). End quietly, as a process killed by SIGPIPE does
+        # and bd does: exit 141. Point stdout at /dev/null so the interpreter's final flush of
+        # what is still buffered does not print "Exception ignored ... BrokenPipeError".
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError):          # stdout is not a file (a test's capture)
+            pass
+        return 141
     except (OSError, sqlite3.Error) as exc:
         print(f"{PROG}: error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2

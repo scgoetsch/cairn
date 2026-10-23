@@ -7,6 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from cairn import cli as cli_module
 from cairn.store import STORE_DIRNAME, find_store_dir
 
 from .helpers import StoreCase, child, dep, issue, with_deps
@@ -126,6 +127,23 @@ class HookContractTest(StoreCase):
         code, out, err = self.cli("show", "t-nope")
         self.assertEqual((code, out), (1, ""))
         self.assertIn('no issue found matching "t-nope"', err)
+
+    def test_show_takes_several_ids_like_bd(self):
+        # bd 1.1.2, measured 2026-10-23 (workspace-7m8.31): `bd show A B` prints each, a rule
+        # between them; --json is one array; a missing id is reported and skipped, exit 0.
+        code, out, err = self.cli("show", "t-blocked", "t-nope", "t-epic.1", "--json")
+        self.assertEqual((code, [i["id"] for i in json.loads(out)]), (0, ["t-blocked", "t-epic.1"]))
+        self.assertIn('no issue found matching "t-nope"', err)
+        code, text, _ = self.cli("show", "t-blocked", "t-epic.1")
+        self.assertEqual(code, 0)
+        first, second = text.split(f"\n\n{cli_module.SHOW_RULE}\n\n")
+        self.assertTrue(first.startswith("○ t-blocked "))
+        self.assertTrue(second.startswith("◐ t-epic.1 "))
+
+    def test_show_fails_only_when_no_id_is_found(self):
+        code, out, err = self.cli("show", "t-nope", "t-nope2", "--json")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err.count("no issue found matching"), 2)
 
 
 class RefusalTest(StoreCase):
@@ -260,3 +278,20 @@ class LauncherTest(StoreCase):
                               capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual([i["id"] for i in json.loads(proc.stdout)], ["t-epic.1"])
+
+    def test_a_closed_pipe_ends_quietly_like_bd(self):
+        # `cairn ready --json | true`: the output fits Python's buffer, so the broken pipe
+        # surfaced only at interpreter exit, as exit 120 and "Exception ignored ... BrokenPipeError"
+        # (workspace-7m8.32). bd 1.1.2 exits 141 and prints nothing. The read end is closed
+        # before the process starts, so the first write fails every time.
+        self.build(ROWS)
+        launcher = Path(__file__).resolve().parents[1] / "bin" / "cairn"
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        try:
+            proc = subprocess.run([sys.executable, str(launcher), "--json", "list", "--all"],
+                                  cwd=self.workspace, stdout=write_end, stderr=subprocess.PIPE,
+                                  text=True)
+        finally:
+            os.close(write_end)
+        self.assertEqual((proc.returncode, proc.stderr), (141, ""))

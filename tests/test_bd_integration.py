@@ -11,6 +11,8 @@ are the facts a writer has to be designed around.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -20,7 +22,7 @@ import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from cairn import shadow
+from cairn import cli, shadow
 from cairn.queries import Snapshot
 from cairn.store import STORE_DIRNAME, db_path, open_db
 
@@ -153,6 +155,22 @@ class RealBdTest(ThrowawayBdStore):
                 unexplained(shadow.diff(store, self.workspace, "bd", deadline=deadline,
                                         sample_offset=offset)),
                 [], f"show sample at offset {offset}")
+
+    def test_show_of_several_ids_matches_bd(self):
+        # workspace-7m8.31: the issues bd shows, in its order, a missing id skipped; the exit
+        # is 1 only when no id is found.
+        store = self.workspace / STORE_DIRNAME
+        shadow.run(store, self.workspace, "bd", deadline_seconds=120)
+        first, second = self.exported_ids()[:2]
+        for ask in ([second, "t-nope", first], ["t-nope", "t-nope2"]):
+            proc = subprocess.run(["bd", "show", *ask, "--json", "--sandbox"],
+                                  cwd=self.workspace, capture_output=True, text=True)
+            bd_ids = [i["id"] for i in json.loads(proc.stdout)] if proc.returncode == 0 else []
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                code = cli.main(["-C", str(self.workspace), "show", *ask, "--json"])
+            cairn_ids = [i["id"] for i in json.loads(out.getvalue())] if code == 0 else []
+            self.assertEqual((code, cairn_ids), (proc.returncode, bd_ids), ask)
 
 
 @unittest.skipUnless(ENABLED, "set CAIRN_TEST_WITH_BD=1 with bd on PATH to run")
