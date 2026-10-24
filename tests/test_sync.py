@@ -233,3 +233,147 @@ class LineCountTest(StoreCase):
                     self.assertIn("\n\n", "\n" + (text or ""), "only blank lines force a full read")
                 else:
                     self.assertEqual(got, (len(lines), lines[-1] if lines else ""))
+
+
+class QuickStateTest(SyncCase):
+    """The per-verb check (workspace-7m8.4 review; specs/2026-10-22-cairn-gap-closure.md,
+    section 1). It compared only the line where file and store meet, so an edit of an older
+    line of events.jsonl read as `equal` or `ahead` and writes went on. Now: a sidecar hit when
+    this exact file was verified a prefix of this exact database, the full comparison otherwise."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.started()
+        self.store = self.a / ".cairn"
+        self.events = self.a / ".beads" / "events.jsonl"
+        self.stamp = self.store / syncmod.STAMP_FILENAME
+
+    def state(self) -> str:
+        conn = open_writable(db_path(self.store))
+        try:
+            return syncmod.quick_state(conn, self.store)
+        finally:
+            conn.close()
+
+    def counting_full_state(self) -> list:
+        calls, real = [], syncmod.full_state
+        def counted(conn, store_dir):
+            calls.append(1)
+            return real(conn, store_dir)
+        syncmod.full_state = counted
+        self.addCleanup(setattr, syncmod, "full_state", real)
+        return calls
+
+    def edit_line(self, index: int, old: str, new: str, keep_mtime: bool = False) -> None:
+        st = self.events.stat()
+        lines = self.events.read_text(encoding="utf-8").split("\n")
+        self.assertIn(old, lines[index])
+        lines[index] = lines[index].replace(old, new, 1)
+        self.events.write_text("\n".join(lines), encoding="utf-8")
+        if keep_mtime:
+            os.utime(self.events, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+    def test_an_older_line_edited_with_the_store_ahead_refuses_writes(self):
+        self.w(self.a, "create", "--silent", "--title", "not exported yet")
+        self.edit_line(0, '"alice"', '"mallory"')
+        self.assertEqual(self.state(), syncmod.DIVERGED)
+        code, _, err = self.cli("create", "--title", "more", "--actor", "bob", cwd=self.a)
+        self.assertEqual(code, 2)
+        self.assertIn("both moved on", err)
+        code, out, _ = self.cli("sync", "--status", cwd=self.a)
+        self.assertEqual((code, out.split(":")[0]), (2, "diverged"))
+        self.assertIn("event 1", out)
+        self.assertEqual(self.state(), syncmod.DIVERGED)          # diverged is never cached
+
+    def test_an_older_line_edited_at_equal_length_is_diverged(self):
+        self.edit_line(0, '"alice"', '"alicf"')
+        self.assertEqual(self.state(), syncmod.DIVERGED)
+        code, _, _ = self.cli("create", "--title", "more", "--actor", "bob", cwd=self.a)
+        self.assertEqual(code, 2)
+
+    def test_an_unchanged_file_is_a_hit_and_not_compared_again(self):
+        self.w(self.a, "create", "--silent", "--title", "local")
+        calls = self.counting_full_state()
+        self.assertEqual(self.state(), syncmod.AHEAD)
+        self.assertTrue(self.stamp.is_file())
+        first = len(calls)
+        self.assertEqual(self.state(), syncmod.AHEAD)
+        self.assertEqual(len(calls), first, "the second call must not run full_state")
+
+    def test_an_edit_after_a_cached_ahead_is_seen(self):
+        self.w(self.a, "create", "--silent", "--title", "local")
+        self.assertEqual(self.state(), syncmod.AHEAD)
+        self.edit_line(0, '"alice"', '"mallory"')
+        self.assertEqual(self.state(), syncmod.DIVERGED)
+        code, _, _ = self.cli("create", "--title", "more", "--actor", "bob", cwd=self.a)
+        self.assertEqual(code, 2)
+
+    def test_a_replaced_database_does_not_trust_the_sidecar(self):
+        self.assertEqual(self.state(), syncmod.EQUAL)
+        path = db_path(self.store)
+        shutil.copyfile(path, path.with_name("copy.db"))
+        os.replace(path.with_name("copy.db"), path)              # same bytes, new inode
+        calls = self.counting_full_state()
+        self.assertEqual(self.state(), syncmod.EQUAL)
+        self.assertEqual(len(calls), 1)
+
+    def test_the_last_line_rewritten_with_its_mtime_restored_is_a_miss(self):
+        self.assertEqual(self.state(), syncmod.EQUAL)
+        last = len([l for l in self.events.read_text(encoding="utf-8").split("\n") if l]) - 1
+        self.edit_line(last, '"alice"', '"alicf"', keep_mtime=True)
+        calls = self.counting_full_state()
+        self.assertEqual(self.state(), syncmod.DIVERGED)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_malformed_sidecar_is_a_miss_not_an_error(self):
+        good = None
+        self.assertEqual(self.state(), syncmod.EQUAL)
+        good = json.loads(self.stamp.read_text(encoding="utf-8"))
+        bodies = ["{", "[]", json.dumps({**good, "v": 2}), json.dumps({**good, "lines": None}),
+                  json.dumps({**good, "lines": "2"}), json.dumps({**good, "lines": 0}),
+                  json.dumps({**good, "lines": True}), json.dumps({**good, "first": 7})]
+        for body in bodies:
+            with self.subTest(body[:40]):
+                self.stamp.write_text(body, encoding="utf-8")
+                calls = self.counting_full_state()
+                self.assertEqual(self.state(), syncmod.EQUAL)
+                self.assertEqual(len(calls), 1)
+                self.ok(self.a, "ready")
+
+    def test_a_stale_file_stamp_is_a_miss(self):
+        self.assertEqual(self.state(), syncmod.EQUAL)
+        stamp = json.loads(self.stamp.read_text(encoding="utf-8"))
+        stamp["file_mtime_ns"] += 1
+        self.stamp.write_text(json.dumps(stamp), encoding="utf-8")
+        calls = self.counting_full_state()
+        self.assertEqual(self.state(), syncmod.EQUAL)
+        self.assertEqual(len(calls), 1)
+
+    def test_an_unwritable_sidecar_still_answers(self):
+        real = os.replace
+        def refuse(src, dst, *a, **k):
+            if str(dst).endswith(syncmod.STAMP_FILENAME):
+                raise OSError("read-only")
+            return real(src, dst, *a, **k)
+        os.replace = refuse
+        self.addCleanup(setattr, os, "replace", real)
+        self.assertEqual(self.state(), syncmod.EQUAL)
+        self.assertFalse(self.stamp.exists())
+        self.assertEqual([p.name for p in self.store.glob(".stamp-*")], [])
+
+    def test_nothing_is_cached_during_a_merge(self):
+        real = syncmod.merging
+        syncmod.merging = lambda store_dir: True
+        self.addCleanup(setattr, syncmod, "merging", real)
+        self.assertEqual(self.state(), syncmod.EQUAL)
+        self.assertFalse(self.stamp.exists())
+
+    def test_no_events_file_is_no_exports_and_writes_work(self):
+        fresh = self.workspace / "fresh"
+        (fresh / ".beads").mkdir(parents=True)
+        self.ok(fresh, "init", "--prefix", "f")
+        self.w(fresh, "create", "--silent", "--title", "first")
+        conn = open_writable(db_path(fresh / ".cairn"))
+        self.addCleanup(conn.close)
+        self.assertEqual(syncmod.quick_state(conn, fresh / ".cairn"), syncmod.NO_FILE)
+        self.assertFalse((fresh / ".cairn" / syncmod.STAMP_FILENAME).exists())

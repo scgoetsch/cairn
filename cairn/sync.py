@@ -21,6 +21,7 @@ events are the cursor.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -137,25 +138,133 @@ def merge_holds_nothing_new(conn: sqlite3.Connection, store_dir: Path) -> bool:
     return True
 
 
-def quick_state(conn: sqlite3.Connection, store_dir: Path) -> str:
-    """The relation, from the line where the two meet only (every verb runs this, so it reads
-    one store row, not the history). `sync` runs the full comparison before it changes anything."""
-    path = exports_dir(store_dir) / EVENTS
-    counted = count_and_last_line(path)
-    if counted is None:
-        lines = file_lines(path)
-        counted = (len(lines), lines[-1] if lines else "")
-    tracked, last = counted
-    if not tracked:
-        return NO_FILE
+STAMP_FILENAME = "events-sync-stamp.json"   # in .cairn/, which git ignores
+STAMP_FIELDS = ("file_dev", "file_ino", "file_size", "file_mtime_ns", "db_dev", "db_ino", "lines")
+
+
+def _first_line(f) -> str:
+    """The first non-empty line of an open binary file, as file_lines yields it ("" when none)."""
+    f.seek(0)
+    for raw in f:
+        line = raw.rstrip(b"\n")
+        if line:
+            return line.decode("utf-8")
+    return ""
+
+
+def _last_line(f, size: int) -> str:
+    """The last non-empty line, read back from the end of an open binary file."""
+    tail = b""
+    while True:
+        start = max(0, size - len(tail) - (1 << 16))
+        f.seek(start)
+        tail = f.read(size - start)
+        body = tail.rstrip(b"\n")
+        cut = body.rfind(b"\n")
+        if cut >= 0 or start == 0:
+            return body[cut + 1:].decode("utf-8")
+
+
+def _read_stamp(store_dir: Path) -> Optional[dict]:
+    """The sidecar, or None for anything that is not a well-formed v1 stamp (a miss, never an
+    error: every verb of a writable store reads it)."""
+    try:
+        stamp = json.loads((store_dir / STAMP_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(stamp, dict) or stamp.get("v") != 1:
+        return None
+    if any(type(stamp.get(k)) is not int for k in STAMP_FIELDS):
+        return None
+    if stamp["lines"] < 1 or not all(isinstance(stamp.get(k), str) for k in ("first", "last")):
+        return None
+    return stamp
+
+
+def _file_stamp(st: os.stat_result) -> Tuple[int, int, int, int]:
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
+
+
+def _hit(conn: sqlite3.Connection, store_dir: Path, path: Path) -> Optional[str]:
+    """`equal` or `ahead` when the sidecar says this exact file was verified a prefix of this
+    exact database and nothing since says otherwise; None for a miss."""
+    stamp = _read_stamp(store_dir)
+    if stamp is None:
+        return None
+    try:
+        db = os.stat(db_path(store_dir))
+    except OSError:
+        return None
+    if (db.st_dev, db.st_ino) != (stamp["db_dev"], stamp["db_ino"]):
+        return None
+    with open(path, "rb") as f:
+        before = os.fstat(f.fileno())
+        if _file_stamp(before) != tuple(stamp[k] for k in STAMP_FIELDS[:4]):
+            return None
+        lines = stamp["lines"]
+        if _first_line(f) != stamp["first"] or _last_line(f, before.st_size) != stamp["last"]:
+            return None
+        if _line_at(conn, 0) != stamp["first"] or _line_at(conn, lines - 1) != stamp["last"]:
+            return None
+        after = os.fstat(f.fileno())
+        if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+            return None
+    try:
+        now = os.stat(path)
+    except OSError:
+        return None
+    if (now.st_dev, now.st_ino) != (before.st_dev, before.st_ino):
+        return None                                   # the path was replaced after the open
     count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    if tracked <= count:
-        if _line_at(conn, tracked - 1) != last:
-            return AHEAD if merge_holds_nothing_new(conn, store_dir) else DIVERGED
-        return EQUAL if tracked == count else AHEAD
-    if count and _line_at(conn, count - 1) != file_lines(path)[count - 1]:
-        return AHEAD if merge_holds_nothing_new(conn, store_dir) else DIVERGED
-    return BEHIND
+    if count < lines:
+        return None
+    return EQUAL if count == lines else AHEAD
+
+
+def _write_stamp(store_dir: Path, path: Path, before: os.stat_result) -> None:
+    """Record that the file at stamp `before` is a prefix of this database. Only when the file
+    did not change while it was compared; a failed write leaves "compare every verb"."""
+    try:
+        lines = file_lines(path)                      # read first, so the restat covers the read
+        after = os.stat(path)
+        if not lines or not path.is_file() or _file_stamp(after) != _file_stamp(before):
+            return
+        db = os.stat(db_path(store_dir))
+        stamp = dict(zip(STAMP_FIELDS[:4], _file_stamp(after)))
+        stamp.update(v=1, db_dev=db.st_dev, db_ino=db.st_ino, lines=len(lines),
+                     first=lines[0], last=lines[-1])
+    except OSError:
+        return
+    fd, tmp = tempfile.mkstemp(dir=store_dir, prefix=".stamp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(stamp, f)
+        os.replace(tmp, store_dir / STAMP_FILENAME)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def quick_state(conn: sqlite3.Connection, store_dir: Path) -> str:
+    """The relation, cheaply. Every verb runs this. The common case is a sidecar hit: this exact
+    file was verified a prefix of this exact database, so a count and two rows answer, with no
+    decode of the history. Anything else is the full comparison, cached when it says the file
+    is a prefix and no merge is under way. Comparing only the line where the two meet, as this
+    did before, called an edit of an older line `equal` or `ahead` and let writes through
+    (workspace-7m8.4 review; specs/2026-10-22-cairn-gap-closure.md, section 1)."""
+    path = exports_dir(store_dir) / EVENTS
+    if not path.is_file():
+        return full_state(conn, store_dir)[0]         # no-exports: never opened, never cached
+    hit = _hit(conn, store_dir, path)
+    if hit is not None:
+        return hit
+    before = os.stat(path)
+    state = full_state(conn, store_dir)[0]
+    if state in (EQUAL, AHEAD) and not merging(store_dir):
+        _write_stamp(store_dir, path, before)
+    return state
 
 
 def full_state(conn: sqlite3.Connection, store_dir: Path) -> Tuple[str, str]:
