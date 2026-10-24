@@ -384,9 +384,10 @@ def cmd_export(args, start: Path) -> int:
     finally:
         if temp.exists():
             temp.unlink()
+    # On stderr, as bd prints it: a caller that keeps stdout (a session hook) gets no notice.
     print(f"Exported {len(lines)} events to {args.output}" if args.events
           else f"Exported the allocator state to {args.output}" if args.allocator
-          else f"Exported {issue_count} issues to {args.output}")
+          else f"Exported {issue_count} issues to {args.output}", file=sys.stderr)
     return 0
 
 

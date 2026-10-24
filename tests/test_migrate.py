@@ -277,7 +277,8 @@ class EventsExportTest(StoreCase):
         self.assertEqual(self.cli("export", "--allocator", "-o", str(alloc), cwd=live)[0], 0)
         code, msg, err = self.cli("export", "--events", "-o", str(events), cwd=live)
         self.assertEqual(code, 0, err)
-        self.assertIn(f"Exported {len(rows)} events", msg)
+        self.assertEqual(msg, "", "the notice goes to stderr, as bd's does")
+        self.assertIn(f"Exported {len(rows)} events", err)
         self.assertEqual(events.read_text(), out)
         fresh = self.workspace / "fresh"
         fresh.mkdir()
