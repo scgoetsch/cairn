@@ -109,6 +109,10 @@ class SyncTest(SyncCase):
         code, _, err = self.cli("ready", cwd=self.b)
         self.assertEqual(code, 0)
         self.assertIn("warning", err)
+        code, out, err = self.cli("history", issue, "--json", cwd=self.b)   # a read: answers, warns
+        self.assertEqual(code, 0, err)
+        self.assertIn("warning", err)
+        self.assertNotIn("status", [e["data"].get("field") for e in json.loads(out)])
         self.assertIn("old database is", self.ok(self.b, "sync"))
         self.assertTrue(any(p.name.startswith("cairn.db.before-sync-")
                             for p in (self.b / ".cairn").iterdir()))

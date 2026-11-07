@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import unittest
 
 from cairn.queries import event_objects
 from cairn.store import db_path, open_db
@@ -146,3 +147,62 @@ class ShadowHistoryTest(StoreCase):
         self.assertEqual((code, out.strip()), (0, "No events for bd-1"), err)
         code, out, err = self.cli("history", "--memory", "m", "--json")
         self.assertEqual((code, json.loads(out)), (0, []), err)
+
+
+class HistorySubjectTest(WritableCase):
+    """Whether a subject exists does not depend on --kind (grok's review of 6b5c0a8)."""
+
+    def drop_rows(self, *sql: str) -> None:
+        conn = sqlite3.connect(db_path(self.store_dir))
+        for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'").fetchall():
+            conn.execute(f'DROP TRIGGER "{name}"')
+        for statement in sql:
+            conn.execute(statement)
+        conn.commit()
+        conn.close()
+
+    def test_deleted_issue_with_a_kind_that_matches_nothing(self):
+        issue_id = self.new("doomed")
+        self.w("delete", issue_id, "--force")
+        code, out, err = self.cli("history", issue_id, "--kind", "comment_added", "--json")
+        self.assertEqual((code, json.loads(out)), (0, []), err)
+        code, out, _ = self.cli("history", issue_id, "--kind", "comment_added")
+        self.assertEqual((code, out.strip()), (0, f"No events for {issue_id}"))
+
+    def test_a_key_known_only_from_its_events(self):
+        self.w("remember", "--key", "k", "body")
+        self.w("forget", "k")
+        self.drop_rows("DELETE FROM memory_tombstones WHERE key = 'k'")
+        code, out, err = self.cli("history", "--memory", "k", "--kind", "no_such_kind", "--json")
+        self.assertEqual((code, json.loads(out)), (0, []), err)
+
+    def test_a_tombstone_without_events(self):
+        # A bd-era deletion from the ledger: a tombstone, no memory row, no events.
+        self.w("remember", "--key", "k", "body")
+        self.w("forget", "k")
+        self.drop_rows("DELETE FROM events WHERE memory_key = 'k'")
+        code, out, err = self.cli("history", "--memory", "k", "--json")
+        self.assertEqual((code, json.loads(out)), (0, []), err)
+        self.drop_rows("DELETE FROM memory_tombstones WHERE key = 'k'")
+        self.assertEqual(self.cli("history", "--memory", "k")[0], 1)
+
+    def test_text_of_a_notes_append(self):
+        issue_id = self.new("noted")
+        self.w("note", issue_id, "first")
+        self.w("note", issue_id, "second line\nthird line")
+        code, out, err = self.cli("history", issue_id, "--kind", "field_change", "--limit", "1")
+        self.assertEqual(code, 0, err)
+        # The tail only, as stored; its lines indented under the key, then the next key.
+        self.assertIn("  appended: \n    second line\n    third line\n  field: notes\n", out)
+
+
+class HistoryValueTest(unittest.TestCase):
+    def test_scalars(self):
+        from cairn.cli import history_value
+        self.assertEqual(history_value(None), "null")
+        self.assertEqual(history_value(True), "true")
+        self.assertEqual(history_value(False), "false")
+        self.assertEqual(history_value(0), "0")
+        self.assertEqual(history_value("a\nb"), "a\n    b")
+        self.assertEqual(history_value({"b": 1, "a": "é"}), '{"a": "é", "b": 1}')
+        self.assertEqual(history_value("plain"), "plain")

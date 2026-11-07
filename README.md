@@ -40,7 +40,7 @@ cairn list  [--status=in_progress] [--all] [--json] [-n N]
 cairn blocked | show ID... | stats | where | check
 cairn memories [keyword] | recall KEY
 cairn history ID [--limit N] [--kind KIND] [--json]          # events of one issue, oldest first
-cairn history --memory KEY [--limit N] [--kind KIND] [--json]  # every body a key has had
+cairn history --memory KEY [--limit N] [--kind KIND] [--json]  # its events, each with the body it replaced
 cairn prime [--budget BYTES]         # default 10000: what Claude Code shows of a hook in full
 cairn export [--include-memories | --all | --allocator | --events] [-o FILE]
 cairn import FILE [--interactions F] [--ledger F] [--hot F]   # build from files, no bd
@@ -463,15 +463,18 @@ take its text out of the checkout (it never took it out of git history). bd
 kept earlier versions only in Dolt's history, where no bd verb reached them.
 
 `cairn history --memory KEY` prints them: each `memory_set` with the body it replaced
-(`old_value`), and a `memory_deleted` with the last one, even after `forget` (when `recall` exits 1).
-`cairn history ID` does the same for an issue, a deleted one included (its `deleted` event holds the
-issue as it was). Order is recording order, never time order; `--limit N` keeps the newest N, still
-oldest first; `--kind` is an exact match. `--json` is a list of the objects `export --events` writes.
-The text shows each event's `data` keys sorted, strings and numbers unquoted, `null` as `null`,
-lists and objects as one sorted JSON line, and the lines of a multi-line value indented under its
-key. An unknown issue or key exits 1; one that exists with no events (an issue imported from bd
-without history) prints `No events for ID` and exits 0. A read verb: it answers on a shadow and on
-a store that is behind or diverged, after the warning.
+(`old_value`), and a `memory_deleted` with the last one, even after `forget` (when `recall` exits
+1). `cairn history ID` does the same for an issue, a deleted one included (its `deleted` event
+holds the issue as it was). Order is recording order, never time order; `--limit N` keeps the
+newest N, still oldest first; `--kind` is an exact match. `--json` is a list of the objects `export
+--events` writes. Each event's `data` is printed as stored: a `memory_set` shows the body it
+replaced, not the new one (`recall` shows the live body; a new key's `old_value` is `null`, and a
+row written under 0.4.0 has hashes only), and a notes append shows only the added tail
+(`appended`). The text shows each event's `data` keys sorted, strings and numbers unquoted, `null`
+as `null`, lists and objects as one sorted JSON line, and the lines of a multi-line value indented
+under its key. An unknown issue or key exits 1; one that exists with no events (an issue imported
+from bd without history) prints `No events for ID` and exits 0. A read verb: it answers on a shadow
+and on a store that is behind or diverged, after the warning.
 
 ## Known limits
 
@@ -491,8 +494,9 @@ a store that is behind or diverged, after the warning.
 - `create --id` with a child-shaped id makes no parent link, as in bd.
 - The stored status `blocked` is accepted because bd accepts it, while whether
   an issue *is* blocked is computed from dependencies.
-- Imported history comes from bd's audit log, which records issue field changes
-  only; there are no memory events.
+- History imported from `interactions.jsonl` alone (`init --interactions`) is
+  bd's audit log: issue field changes only, no memory events. `history-from-dolt`
+  carries the rest, memory versions included (above).
 - `cairn prime` prints its own layout, not bd's.
 
 ## Tests

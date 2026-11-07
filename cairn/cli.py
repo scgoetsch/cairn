@@ -351,11 +351,17 @@ def history_value(value: Any) -> str:
 
 
 def history_subject_exists(conn, issue_id: Optional[str], key: Optional[str]) -> bool:
-    """The subject of a history with no events: an issue row, or a memory row or tombstone.
-    (A subject with events exists by having them: a deleted issue, a forgotten key.)"""
+    """Whether the subject of an empty (or empty after --kind) history exists: any event of it,
+    whatever its kind (a deleted issue, a key known only from its events), or an issue row, or a
+    memory row or tombstone (gap-closure spec, section 3: missing only when all are absent)."""
     if issue_id is not None:
-        return conn.execute("SELECT 1 FROM issues WHERE id = ?", (issue_id,)).fetchone() is not None
-    return (conn.execute("SELECT 1 FROM memories WHERE key = ?", (key,)).fetchone() is not None
+        return (conn.execute("SELECT 1 FROM events WHERE issue_id = ? LIMIT 1",
+                             (issue_id,)).fetchone() is not None
+                or conn.execute("SELECT 1 FROM issues WHERE id = ?", (issue_id,)).fetchone()
+                is not None)
+    return (conn.execute("SELECT 1 FROM events WHERE memory_key = ? LIMIT 1",
+                         (key,)).fetchone() is not None
+            or conn.execute("SELECT 1 FROM memories WHERE key = ?", (key,)).fetchone() is not None
             or conn.execute("SELECT 1 FROM memory_tombstones WHERE key = ?",
                             (key,)).fetchone() is not None)
 
