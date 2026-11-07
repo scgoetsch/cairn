@@ -39,6 +39,8 @@ cairn ready [--json] [-n N] [-p P1] [-t bug] [--parent ID] [--include-deferred]
 cairn list  [--status=in_progress] [--all] [--json] [-n N]
 cairn blocked | show ID... | stats | where | check
 cairn memories [keyword] | recall KEY
+cairn history ID [--limit N] [--kind KIND] [--json]          # events of one issue, oldest first
+cairn history --memory KEY [--limit N] [--kind KIND] [--json]  # every body a key has had
 cairn prime [--budget BYTES]         # default 10000: what Claude Code shows of a hook in full
 cairn export [--include-memories | --all | --allocator | --events] [-o FILE]
 cairn import FILE [--interactions F] [--ledger F] [--hot F]   # build from files, no bd
@@ -459,6 +461,17 @@ back. That includes `forget`: the body a `forget` removes from `memories.jsonl`
 lands in the events file at the next export, so forgetting a memory does not
 take its text out of the checkout (it never took it out of git history). bd
 kept earlier versions only in Dolt's history, where no bd verb reached them.
+
+`cairn history --memory KEY` prints them: each `memory_set` with the body it replaced
+(`old_value`), and a `memory_deleted` with the last one, even after `forget` (when `recall` exits 1).
+`cairn history ID` does the same for an issue, a deleted one included (its `deleted` event holds the
+issue as it was). Order is recording order, never time order; `--limit N` keeps the newest N, still
+oldest first; `--kind` is an exact match. `--json` is a list of the objects `export --events` writes.
+The text shows each event's `data` keys sorted, strings and numbers unquoted, `null` as `null`,
+lists and objects as one sorted JSON line, and the lines of a multi-line value indented under its
+key. An unknown issue or key exits 1; one that exists with no events (an issue imported from bd
+without history) prints `No events for ID` and exits 0. A read verb: it answers on a shadow and on
+a store that is behind or diverged, after the warning.
 
 ## Known limits
 

@@ -113,6 +113,26 @@ def event_objects(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     return [event_object(r) for r in rows]
 
 
+def history_events(conn: sqlite3.Connection, *, issue_id: Optional[str] = None,
+                   memory_key: Optional[str] = None,
+                   kind: Optional[str] = None) -> List[Dict[str, Any]]:
+    """`cairn history`: the events of one issue or one memory key, in recording order
+    (rowid, as `event_objects`; never re-sorted by time), optionally of one kind.
+    Exactly one of issue_id / memory_key. No index on memory_key: one scan of
+    `events` per explicit call (gap-closure spec, section 3)."""
+    if (issue_id is None) == (memory_key is None):
+        raise ValueError("history_events: exactly one of issue_id and memory_key")
+    if issue_id is not None:
+        rows = conn.execute("SELECT id, kind, issue_id, memory_key, actor, created_at, data "
+                            "FROM events WHERE issue_id = ? AND (? IS NULL OR kind = ?) "
+                            "ORDER BY rowid", (issue_id, kind, kind))
+    else:
+        rows = conn.execute("SELECT id, kind, issue_id, memory_key, actor, created_at, data "
+                            "FROM events WHERE memory_key = ? AND (? IS NULL OR kind = ?) "
+                            "ORDER BY rowid", (memory_key, kind, kind))
+    return [event_object(r) for r in rows.fetchall()]
+
+
 def event_object(row: Any) -> Dict[str, Any]:
     """One events row as `export --events` writes it."""
     obj: Dict[str, Any] = {"_type": "event"}

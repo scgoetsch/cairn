@@ -24,8 +24,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from . import PROG, __version__, doltseed, prime, shadow, sync as syncmod, timeutil
 from .importer import ENV_PREFIXES, SourceError, build_store, build_writable, read_jsonl
-from .queries import (LINKED_OMITS, Snapshot, check, events_lines, export_lines, memories,
-                      recall, stats)
+from .queries import (LINKED_OMITS, Snapshot, check, events_lines, export_lines,
+                      history_events, memories, recall, stats)
 from .store import (GITIGNORE, STORE_DIRNAME, StoreError, db_path, find_store_dir,
                     get_meta, init_store, load_config, migrate, open_db, open_writable)
 from .writer import WriteConflict, WriteRefused, Writer
@@ -333,6 +333,74 @@ def cmd_recall(args, start: Path) -> int:
         return 1
     print(row["value"])
     return 0
+
+
+def history_value(value: Any) -> str:
+    """One `data` value as `history` prints it (gap-closure spec, section 3): strings and
+    numbers unquoted, JSON null as `null`, booleans `true`/`false` (bool is tested before
+    int), lists and objects as one sorted `json.dumps` line. A multi-line string (a notes
+    snapshot, a memory body) keeps its lines; each one after the first is indented under
+    its key so the next key still starts a line of its own."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    return str(value).replace("\n", "\n    ")
+
+
+def history_subject_exists(conn, issue_id: Optional[str], key: Optional[str]) -> bool:
+    """The subject of a history with no events: an issue row, or a memory row or tombstone.
+    (A subject with events exists by having them: a deleted issue, a forgotten key.)"""
+    if issue_id is not None:
+        return conn.execute("SELECT 1 FROM issues WHERE id = ?", (issue_id,)).fetchone() is not None
+    return (conn.execute("SELECT 1 FROM memories WHERE key = ?", (key,)).fetchone() is not None
+            or conn.execute("SELECT 1 FROM memory_tombstones WHERE key = ?",
+                            (key,)).fetchone() is not None)
+
+
+def cmd_history(args, start: Path) -> int:
+    # A read verb (connect, not open_writer): it answers on a shadow and on a store that is
+    # behind or diverged, with the warning connect prints. Order is the recording order.
+    if (args.id is None) == (args.memory is None):
+        print(f"{PROG}: error: history takes an issue id or --memory KEY, exactly one",
+              file=sys.stderr)
+        return 2
+    conn = connect(start)
+    events = history_events(conn, issue_id=args.id, memory_key=args.memory, kind=args.kind)
+    if not events and not history_subject_exists(conn, args.id, args.memory):
+        if args.id is not None:
+            print(f'Error fetching {args.id}: no issue found matching "{args.id}"',
+                  file=sys.stderr)
+        else:
+            print(f'no memory with key "{args.memory}"', file=sys.stderr)
+        return 1
+    if args.limit:
+        events = events[-args.limit:]
+    if args.json:
+        emit_json(events)
+        return 0
+    subject = args.id if args.id is not None else f"memory {args.memory}"
+    if not events:
+        print(f"No events for {args.id if args.id is not None else args.memory}")
+        return 0
+    print(f"History for {subject} ({len(events)} event{'' if len(events) == 1 else 's'})\n")
+    for event in events:
+        print(f"{event['created_at']}  {event['kind']}  actor={history_value(event['actor'])}")
+        for key in sorted(event["data"] or {}):
+            print(f"  {key}: {history_value(event['data'][key])}")
+    return 0
+
+
+def non_negative(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: '{text}'") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {value}")
+    return value
 
 
 def cmd_prime(args, start: Path) -> int:
@@ -982,6 +1050,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("recall", help="print one memory by key")
     p.add_argument("key")
     p.set_defaults(func=cmd_recall)
+
+    p = sub.add_parser("history", help="events of one issue, or of one memory key (--memory), "
+                                       "oldest first")
+    p.add_argument("id", nargs="?", help="issue id")
+    p.add_argument("--memory", metavar="KEY", help="a memory key instead of an issue")
+    p.add_argument("--kind", help="only events of this kind (created, field_change, "
+                                  "memory_set, ...)")
+    p.add_argument("--limit", type=non_negative, default=0,
+                   help="only the newest N, printed oldest first (0: all)")
+    p.set_defaults(func=cmd_history)
 
     p = sub.add_parser("prime", help="session priming payload, held to a byte budget")
     p.add_argument("--budget", type=int, default=prime.DEFAULT_BUDGET)
