@@ -117,15 +117,23 @@ dated by its Dolt commit, carries `data.dolt_commit`, has the id
 `dolt-<hash>` (two runs give the same file), and takes its actor from the row
 bd wrote to its `events` table in that commit. `--interactions` merges bd's
 field-change log in by time and keeps a change both sources hold once, from
-the log. `--export` names the memories that must have a history: if the export
-has memories and Dolt has none under `config.kv.memory.*` (where bd 1.1.2
-keeps them), the read fails rather than write a history without them.
+the log (same issue, field and values, within 5 seconds; a notes append in Dolt
+matches the log's full-shape row of it). `--export` is the export taken with
+this Dolt store, and the history must end at it: every memory body and every
+issue column the reader carries, or the read fails and nothing is written. That
+catches a stale copy, a gapped log, and a bd that keeps memories somewhere other
+than `config.kv.memory.*` (bd 1.1.2's place). `-o` refuses an existing file: on
+a store that is already cairn, the history goes into its events file by a
+splice, never written over it.
 
 The manifest says what was read, carried and dropped, and what stays in Dolt
 whatever the reader does: the commit graph (hashes and dates ride along, parent
 links and messages do not), the order of changes inside one commit, the Dolt
-committer (never used as the actor), bd's `events` rows themselves, changes
-between two commits, issue columns and tables cairn has no place for (named).
+committer (never used as the actor), bd's `events` rows themselves (each row's
+fate is counted by type: its commit carried, its commit carrying nothing, or
+removed by bd), changes between two commits, the text of comments on deleted
+issues, issue columns and tables cairn has no place for (named), and the
+source repository it read.
 A history with merge commits is refused. `dev/verify-dolt-history.py` checks a
 written file against the Dolt copy: every memory body and every issue text
 value Dolt ever held must be recoverable from the file plus the export.

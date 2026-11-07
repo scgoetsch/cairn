@@ -53,8 +53,8 @@ from .queries import go_json
 MEMORY_PREFIX = "kv.memory."
 # Issue columns cairn stores, minus the key and the ones that never change or move on every write.
 DIFF_COLUMNS = ("title", "description", "design", "acceptance_criteria", "notes", "status",
-                "priority", "issue_type", "assignee", "owner", "started_at", "closed_at",
-                "close_reason", "defer_until")
+                "priority", "issue_type", "assignee", "owner", "created_at", "created_by",
+                "started_at", "closed_at", "close_reason", "defer_until")
 ROW_COLUMNS = ("id", "title", "description", "design", "acceptance_criteria", "notes", "status",
                "priority", "issue_type", "assignee", "owner", "created_at", "created_by",
                "updated_at", "started_at", "closed_at", "close_reason", "defer_until")
@@ -84,10 +84,10 @@ def dolt_copy(source: Path, dolt: str = "dolt") -> Iterator[Tuple[Path, Query]]:
     repo = find_dolt_repo(source)
     with tempfile.TemporaryDirectory(prefix="cairn-dolt-") as tmp:
         copy = Path(tmp) / "repo"
-        shutil.copytree(repo, copy, symlinks=True)
+        shutil.copytree(repo, copy, symlinks=False)   # a link would still reach the live store
         home = Path(tmp) / "home"         # dolt wants a user config; never touch ~/.dolt
         home.mkdir()
-        env = {**os.environ, "HOME": str(home), "DOLT_ROOT_PATH": str(home)}
+        env = {**os.environ, "HOME": str(home), "DOLT_ROOT_PATH": str(home), "TZ": "UTC"}
         for key, value in (("user.name", "cairn"), ("user.email", "cairn@localhost")):
             subprocess.run([dolt, "config", "--global", "--add", key, value], env=env,
                            capture_output=True, check=False)
@@ -156,19 +156,26 @@ class Reader:
         ordered = sorted(rows, key=lambda r: (r["date"], r["commit_hash"]))
         self.manifest["read"]["commits"] = len(rows)
         self.manifest["committers"] = sorted({r["committer"] for r in rows})
-        return {r["commit_hash"]: (i, iso(r["date"], fraction=True) or "")
-                for i, r in enumerate(ordered)}
+        timeline = {r["commit_hash"]: (i, iso(r["date"], fraction=True) or "")
+                    for i, r in enumerate(ordered)}
+        bad = [h for h, (_, stamp) in timeline.items() if timeutil.parse(stamp) is None]
+        if bad:
+            raise HistoryError(f"{len(bad)} Dolt commit date(s) this reader cannot parse "
+                               f"(first: {bad[0]}); refusing rather than misplace events")
+        return timeline
 
     def actors(self) -> Dict[str, str]:
         """The actor of each commit, from the rows bd's events table gained in it; a commit
-        with no such row, or with more than one actor, has none."""
-        rows = self.q("SELECT to_commit, to_actor FROM dolt_diff_events "
-                      "WHERE diff_type = 'added' AND to_commit <> 'WORKING'")
+        with no such row, or with more than one actor, has none. Keeps every row's commit and
+        type for the per-row disposition in the manifest (`bd_events`)."""
+        rows = self.q("SELECT diff_type, to_commit, to_actor, to_event_type, from_event_type "
+                      "FROM dolt_diff_events WHERE to_commit <> 'WORKING'")
+        self.bd_events = rows
         seen: Dict[str, set] = defaultdict(set)
         for r in rows:
-            if r.get("to_actor"):
+            if r["diff_type"] == "added" and r.get("to_actor"):
                 seen[r["to_commit"]].add(r["to_actor"])
-        self.manifest["read"]["bd_events_added"] = len(rows)
+        self.manifest["read"]["bd_events_changes"] = len(rows)
         many = sum(1 for a in seen.values() if len(a) > 1)
         if many:
             self.manifest["warnings"].append(f"{many} commit(s) carry more than one actor; "
@@ -185,10 +192,15 @@ class Reader:
         return rows
 
 
-def read_history(query: Query, *, export_memory_keys: Sequence[str] = ()) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def read_history(query: Query, *, export: Optional[Sequence[Dict[str, Any]]] = None,
+                 source: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """The Dolt history as cairn event objects (unordered against interactions; each carries
-    `_order`, the commit index) and the manifest."""
+    `_order`, the commit index) and the manifest. With `export` (the bd export rows the migration
+    imports), the history's last state must BE that export: every memory body and every issue
+    column the reader carries, or HistoryError (a stale copy, a gapped log, memories kept
+    elsewhere, a dolt that diffs only the working set)."""
     r = Reader(query)
+    r.manifest["source"] = source
     tables = {next(iter(row.values())) for row in query("SHOW TABLES")}
     missing = [t for t in REQUIRED_TABLES if t not in tables and t != "dolt_log"]
     if missing:
@@ -201,7 +213,10 @@ def read_history(query: Query, *, export_memory_keys: Sequence[str] = ()) -> Tup
     r.manifest["tables_not_read"] = sorted(t for t in tables
                                            if t not in READ_TABLES and not t.startswith("dolt_"))
     commits = r.commits()
+    r.bd_events = []
     actors = r.actors() if "events" in tables else {}
+    if "events" not in tables:
+        r.manifest["warnings"].append("no events table: no event has an actor")
     out: List[Dict[str, Any]] = []
     per_commit: Counter = Counter()
 
@@ -231,8 +246,11 @@ def read_history(query: Query, *, export_memory_keys: Sequence[str] = ()) -> Tup
 
     # issues
     notes_seen: set = set()
+    last_issue: Dict[str, Optional[Dict[str, Any]]] = {}
     for d in sorted(r.diff("issues", row_cols), key=lambda d: commits[d["to_commit"]][0]):
         commit, kind = d["to_commit"], d["diff_type"]
+        if kind in ("added", "modified"):
+            last_issue[d["to_id"]] = {c: column_value(c, d.get(f"to_{c}")) for c in diff_cols}
         if kind == "added":
             issue_id = d["to_id"]
             emit(commit, "created", {"title": d.get("to_title"),
@@ -254,15 +272,19 @@ def read_history(query: Query, *, export_memory_keys: Sequence[str] = ()) -> Tup
                 emit(commit, "field_change", data, issue_id=issue_id, key=(col,))
         elif kind == "removed":
             issue_id = d["from_id"]
+            last_issue[issue_id] = None
+            notes_seen.discard((issue_id, "notes"))     # a re-created id starts a new chain
             row = {c: column_value(c, d.get(f"from_{c}")) for c in row_cols}
             emit(commit, "deleted", {"issue": row, "labels": [], "comments": [],
                                      "dependencies": []}, issue_id=issue_id, key=("deleted",))
             r.manifest["left_behind"].append(
-                f"deleted issue {issue_id}: its labels, comments and dependencies at deletion")
+                f"deleted issue {issue_id}: the text of its comments (its label and dependency "
+                "removals are carried as their own events)")
 
     # memories (and a count of the other config keys, which cairn has no place for)
     other_config = 0
     found_keys: set = set()
+    last_memory: Dict[str, Optional[str]] = {}
     for d in sorted(r.diff("config", ("key", "value")), key=lambda d: commits[d["to_commit"]][0]):
         name = d.get("to_key") or d.get("from_key") or ""
         if not name.startswith(MEMORY_PREFIX):
@@ -272,6 +294,7 @@ def read_history(query: Query, *, export_memory_keys: Sequence[str] = ()) -> Tup
         found_keys.add(key)
         commit, kind = d["to_commit"], d["diff_type"]
         old, new = d.get("from_value"), d.get("to_value")
+        last_memory[key] = None if kind == "removed" else new
         if kind == "added":
             emit(commit, "memory_set", {"old_hash": None, "new_hash": body_hash(new),
                                         "old_value": None}, memory_key=key, key=("set",))
@@ -284,20 +307,15 @@ def read_history(query: Query, *, export_memory_keys: Sequence[str] = ()) -> Tup
             emit(commit, "memory_deleted", {"old_hash": body_hash(old), "old_value": old},
                  memory_key=key, key=("deleted",))
     r.manifest["config_changes_not_memories"] = other_config
-    absent = sorted(set(export_memory_keys) - found_keys)
-    if export_memory_keys and not found_keys:
-        raise HistoryError("the export has memories and the Dolt history has none under "
-                           f"config.{MEMORY_PREFIX}*: this bd keeps memories elsewhere; refusing "
-                           "to write a history without them")
-    if absent:
-        r.manifest["warnings"].append(f"{len(absent)} memory key(s) of the export have no Dolt "
-                                      f"history: {', '.join(absent[:5])}")
+    if export is not None:
+        _check_last_state(export, last_issue, last_memory, diff_cols)
 
     # labels, dependencies, comments
     if "labels" in tables:
         for d in r.diff("labels", ("issue_id", "label")):
             added = d["diff_type"] == "added"
             if d["diff_type"] not in ("added", "removed"):
+                r.manifest["dropped"][f"label_{d['diff_type']}"] += 1
                 continue
             side = "to" if added else "from"
             commit = d["to_commit"]
@@ -306,6 +324,7 @@ def read_history(query: Query, *, export_memory_keys: Sequence[str] = ()) -> Tup
                  key=(d[f"{side}_label"],))
     for d in dep_rows:
         if d["diff_type"] not in ("added", "removed"):
+            r.manifest["dropped"][f"dependency_{d['diff_type']}"] += 1
             continue
         side = "to" if d["diff_type"] == "added" else "from"
         target = next(k for k in d if k.startswith(f"{side}_depends_on"))
@@ -321,6 +340,17 @@ def read_history(query: Query, *, export_memory_keys: Sequence[str] = ()) -> Tup
                 r.manifest["dropped"][f"comment_{d['diff_type']}"] += 1
 
     m = r.manifest
+    # bd's events table, row by row: what became of each
+    disposition: Dict[str, Counter] = defaultdict(Counter)
+    for e in r.bd_events:
+        kind = e.get("to_event_type") or e.get("from_event_type") or "?"
+        if e["diff_type"] == "added":
+            how = ("its commit is carried as events" if per_commit[e["to_commit"]]
+                   else "its commit changed nothing this reader carries")
+        else:
+            how = f"{e['diff_type']} from bd's events table (not carried)"
+        disposition[kind][how] += 1
+    m["bd_events"] = {k: dict(v) for k, v in sorted(disposition.items())}
     m["max_events_in_one_commit"] = max(per_commit.values(), default=0)
     m["events_without_actor"] = sum(1 for e in out if not e["actor"])
     m["left_behind"][:0] = [
@@ -333,6 +363,43 @@ def read_history(query: Query, *, export_memory_keys: Sequence[str] = ()) -> Tup
         "changes made between two commits (only committed states exist)",
     ]
     return out, m
+
+
+def _check_last_state(export: Sequence[Dict[str, Any]],
+                      last_issue: Dict[str, Optional[Dict[str, Any]]],
+                      last_memory: Dict[str, Optional[str]], columns: Sequence[str]) -> None:
+    """The history must end where the export is: else the copy is stale, the log has gaps, or
+    this bd keeps something where the reader does not look. Refuse, naming the first few."""
+    wrong: List[str] = []
+    for row in export:
+        if row.get("_type") == "memory":
+            key = row.get("key")
+            if key not in last_memory:
+                wrong.append(f"memory {key}: no Dolt history under config.{MEMORY_PREFIX}*")
+            elif last_memory[key] != row.get("value"):
+                wrong.append(f"memory {key}: the last body in Dolt differs from the export")
+        elif row.get("_type", "issue") == "issue":
+            issue_id = row.get("id")
+            state = last_issue.get(issue_id)
+            if state is None:
+                wrong.append(f"issue {issue_id}: no Dolt history")
+                continue
+            for col in columns:
+                if col in row and column_value(col, _export_value(col, row[col])) != state[col]:
+                    wrong.append(f"issue {issue_id}: {col} in Dolt differs from the export")
+                    break
+    if wrong:
+        raise HistoryError(f"the Dolt history does not end at the export ({len(wrong)} "
+                           f"difference(s); first: {'; '.join(wrong[:3])}). Use the export and "
+                           "the Dolt store of the same bd, taken together.")
+
+
+def _export_value(column: str, value: Any) -> Any:
+    """An export value in the shape column_value expects (bd exports times as RFC 3339)."""
+    if column in DATETIME_COLUMNS and isinstance(value, str):
+        stamp = timeutil.parse(value)
+        return stamp.strftime("%Y-%m-%d %H:%M:%S") if stamp else value
+    return value
 
 
 def interactions_events(path: Path) -> List[Dict[str, Any]]:
@@ -364,12 +431,17 @@ def merge(dolt: List[Dict[str, Any]], earlier: List[Dict[str, Any]],
     used: set = set()
     kept = []
     for e in sorted(dolt, key=lambda e: e["_order"]):
-        if e["kind"] == "field_change" and "appended" not in e["data"]:
+        if e["kind"] == "field_change":
             when = timeutil.parse(e["created_at"])
-            match = next((i for t, o, n, i in index.get((e["issue_id"], e["data"]["field"]), ())
+            d = e["data"]
+
+            def same(o: Any, n: Any) -> bool:
+                if "appended" in d:          # the log holds the full shape of the same append
+                    return o is not None and n == o + d["appended"]
+                return o == comparable(d.get("old_value")) and n == comparable(d.get("new_value"))
+            match = next((i for t, o, n, i in index.get((e["issue_id"], d["field"]), ())
                           if i not in used and when is not None and abs(t - when) <= SAME_CHANGE
-                          and o == comparable(e["data"].get("old_value"))
-                          and n == comparable(e["data"].get("new_value"))), None)
+                          and same(o, n)), None)
             if match is not None:
                 used.add(match)
                 manifest["dropped"]["field_change already in the earlier history"] += 1

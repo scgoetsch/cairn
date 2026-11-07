@@ -689,13 +689,15 @@ def cmd_seed_from_dolt(args, start: Path) -> int:
 
 def cmd_history_from_dolt(args, start: Path) -> int:
     from . import dolthistory
-    export_keys: List[str] = []
-    if args.export:
-        export_keys = [r["key"] for _, r in read_jsonl(Path(args.export))
-                       if r.get("_type") == "memory" and isinstance(r.get("key"), str)]
+    output = Path(args.output)
+    if output.exists():
+        raise Refused(f"{output} exists; this verb writes a new file (on a store that is already "
+                      "cairn, the history is spliced into its events file by hand, never "
+                      "written over it)")
+    export = [r for _, r in read_jsonl(Path(args.export))] if args.export else None
     try:
-        with dolthistory.dolt_copy(Path(args.source), args.dolt) as (_, query):
-            events, manifest = dolthistory.read_history(query, export_memory_keys=export_keys)
+        with dolthistory.dolt_copy(Path(args.source), args.dolt) as (repo, query):
+            events, manifest = dolthistory.read_history(query, export=export, source=str(repo))
     except doltseed.DoltError as exc:
         raise Refused(str(exc)) from exc
     earlier = (dolthistory.interactions_events(Path(args.interactions))
@@ -1058,8 +1060,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("source", help="the .beads directory or the Dolt repository in it")
     p.add_argument("--dolt", default="dolt", help="dolt executable (bd ships none)")
     p.add_argument("--interactions", help="bd interactions.jsonl, merged in by time")
-    p.add_argument("--export", help="the bd export (`bd export --all`): every memory in it "
-                                    "must have a Dolt history, or the read failed")
+    p.add_argument("--export", help="the bd export (`bd export --all`) taken with this Dolt "
+                                    "store: the history must end at it (every memory body and "
+                                    "issue column), or the read fails")
     p.add_argument("-o", "--output", required=True, help="the events file to write")
     p.add_argument("--manifest", help="write what was carried and left behind here "
                                       "(default: stderr)")

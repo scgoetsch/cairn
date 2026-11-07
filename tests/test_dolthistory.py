@@ -103,9 +103,17 @@ class ReaderTest(unittest.TestCase):
         self.commit("UPDATE issues SET status = 'closed', close_reason = 'done', "
                     "closed_at = '2026-05-01 10:08:00' WHERE id = 't-1'", kind="closed")
 
+    EXPORT = [
+        {"_type": "issue", "id": "t-1", "title": "second title", "description": "d",
+         "notes": "n1\nn2 caf\u00e9", "status": "closed", "close_reason": "done",
+         "closed_at": "2026-05-01T10:08:00Z", "priority": 2},
+        {"_type": "issue", "id": "t-1.1", "title": "child", "status": "open"},
+        {"_type": "memory", "key": "m", "value": "three"},
+    ]
+
     def test_the_history_comes_back_as_cairn_events(self):
         self.build()
-        events, manifest = self.read(export_memory_keys=["m"])
+        events, manifest = self.read(export=self.EXPORT)
         by_kind: Dict[str, List[Dict[str, Any]]] = {}
         for e in events:
             by_kind.setdefault(e["kind"], []).append(e)
@@ -160,7 +168,50 @@ class ReaderTest(unittest.TestCase):
         self.commit("INSERT INTO issues (id, title, status, priority, issue_type) VALUES "
                     "('t-1', 'x', 'open', 2, 'task')")
         with self.assertRaises(dolthistory.HistoryError):
-            self.read(export_memory_keys=["m"])
+            self.read(export=[{"_type": "memory", "key": "m", "value": "v"}])
+
+    def test_a_history_that_does_not_end_at_the_export_fails_the_read(self):
+        """Grok's review of d0eecba: a stale copy or a gapped log must not write a plausible
+        file. Each difference alone refuses."""
+        self.build()
+        self.read(export=self.EXPORT)                                   # ends there: fine
+        for row, field, value in ((2, "value", "two"), (0, "notes", "n1"),
+                                  (1, "status", "closed")):
+            export = [dict(r) for r in self.EXPORT]
+            export[row][field] = value
+            with self.assertRaises(dolthistory.HistoryError, msg=f"{field}={value}"):
+                self.read(export=export)
+        with self.assertRaises(dolthistory.HistoryError):
+            self.read(export=[*self.EXPORT, {"_type": "memory", "key": "new", "value": "x"}])
+
+    def test_every_bd_events_row_is_accounted_for(self):
+        """Acceptance (3): each row of bd's events table, recounted from Dolt itself."""
+        self.build()
+        self.commit("UPDATE labels SET label = label WHERE issue_id = 't-1'")   # no change
+        _, manifest = self.read(export=self.EXPORT)
+        rows = json.loads(self.dolt("sql", "-r", "json", "-q",
+                                    "SELECT COUNT(*) AS n FROM events"))["rows"][0]["n"]
+        counted = sum(n for kinds in manifest["bd_events"].values() for n in kinds.values())
+        self.assertEqual(counted, rows)
+        self.assertEqual(manifest["bd_events"]["updated"]
+                         .get("its commit changed nothing this reader carries"), 1)
+
+    def test_a_re_created_issue_starts_a_new_notes_chain(self):
+        self.commit("INSERT INTO issues (id, title, status, priority, issue_type) VALUES "
+                    "('t-1', 'x', 'open', 2, 'task')", kind="created")
+        self.commit("UPDATE issues SET notes = 'a' WHERE id = 't-1'")
+        self.commit("UPDATE issues SET notes = 'a b' WHERE id = 't-1'")
+        self.commit("DELETE FROM issues WHERE id = 't-1'", kind="deleted")
+        self.commit("INSERT INTO issues (id, title, status, priority, issue_type, notes) VALUES "
+                    "('t-1', 'x', 'open', 2, 'task', 'hello')", kind="created")
+        self.commit("UPDATE issues SET notes = 'hello world' WHERE id = 't-1'")
+        events, _ = self.read()
+        notes = [e["data"] for e in events
+                 if e["kind"] == "field_change" and e["data"]["field"] == "notes"]
+        self.assertEqual([sorted(k for k in n if k != "dolt_commit") for n in notes],
+                         [["field", "new_value", "old_value"], ["appended", "field"],
+                          ["field", "new_value", "old_value"]])
+        self.assertEqual(notes[-1]["old_value"], "hello")
 
     def test_a_store_without_bd_tables_is_refused(self):
         self.dolt("sql", "-q", "DROP TABLE config")
@@ -192,6 +243,15 @@ class MergeTest(unittest.TestCase):
         self.assertEqual([e["id"] for e in merged], ["int-1", "dolt-b", "int-2"])
         self.assertEqual(manifest["earlier_events_matched"], 2)
         self.assertNotIn("_order", merged[1])
+
+    def test_a_notes_append_the_log_also_holds_is_kept_once(self):
+        """Grok's review of d0eecba: Dolt writes the append as `appended`, the log as full."""
+        earlier = [ev("int-1", "2026-05-01T10:00:00.010Z", "t-1", field="notes",
+                      old_value="n1", new_value="n1\nn2")]
+        dolt = [dict(ev("dolt-a", "2026-05-01T10:00:00.040Z", "t-1", field="notes",
+                        appended="\nn2", dolt_commit="c1"), _order=0)]
+        manifest: Dict[str, Any] = {"dropped": Counter(), "carried": Counter(field_change=1)}
+        self.assertEqual([e["id"] for e in dolthistory.merge(dolt, earlier, manifest)], ["int-1"])
 
 
 class FileTest(StoreCase):
