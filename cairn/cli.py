@@ -694,7 +694,7 @@ def cmd_history_from_dolt(args, start: Path) -> int:
         raise Refused(f"{output} exists; this verb writes a new file (on a store that is already "
                       "cairn, the history is spliced into its events file by hand, never "
                       "written over it)")
-    export = [r for _, r in read_jsonl(Path(args.export))] if args.export else None
+    export = [r for _, r in read_jsonl(Path(args.export))]
     try:
         with dolthistory.dolt_copy(Path(args.source), args.dolt) as (repo, query):
             events, manifest = dolthistory.read_history(query, export=export, source=str(repo))
@@ -1060,7 +1060,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("source", help="the .beads directory or the Dolt repository in it")
     p.add_argument("--dolt", default="dolt", help="dolt executable (bd ships none)")
     p.add_argument("--interactions", help="bd interactions.jsonl, merged in by time")
-    p.add_argument("--export", help="the bd export (`bd export --all`) taken with this Dolt "
+    p.add_argument("--export", required=True, help="the bd export (`bd export --all`) taken with this Dolt "
                                     "store: the history must end at it (every memory body and "
                                     "issue column), or the read fails")
     p.add_argument("-o", "--output", required=True, help="the events file to write")

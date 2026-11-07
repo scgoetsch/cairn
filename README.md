@@ -43,7 +43,7 @@ cairn prime [--budget BYTES]         # default 10000: what Claude Code shows of 
 cairn export [--include-memories | --all | --allocator | --events] [-o FILE]
 cairn import FILE [--interactions F] [--ledger F] [--hot F]   # build from files, no bd
 cairn seed-from-dolt BEADS_DIR [--dolt PATH] [-o FILE]        # allocator seed, see below
-cairn history-from-dolt BEADS_DIR -o FILE [--interactions F] [--export F] [--manifest F]
+cairn history-from-dolt BEADS_DIR --export F -o FILE [--interactions F] [--manifest F]
 cairn migrate                                                 # writable store -> this schema
 ```
 
@@ -118,11 +118,16 @@ dated by its Dolt commit, carries `data.dolt_commit`, has the id
 bd wrote to its `events` table in that commit. `--interactions` merges bd's
 field-change log in by time and keeps a change both sources hold once, from
 the log (same issue, field and values, within 5 seconds; a notes append in Dolt
-matches the log's full-shape row of it). `--export` is the export taken with
-this Dolt store, and the history must end at it: every memory body and every
-issue column the reader carries, or the read fails and nothing is written. That
-catches a stale copy, a gapped log, and a bd that keeps memories somewhere other
-than `config.kv.memory.*` (bd 1.1.2's place). `-o` refuses an existing file: on
+matches the log's full-shape row of it). `--export` (required) is the export
+taken with this Dolt store, and the history must end at it: every issue and
+memory on both sides, every memory body and every issue column the reader
+carries (a field the export omits counts as empty), or the read fails and
+nothing is written. That catches a stale copy, a log whose diffs do not add up
+to the present, and a bd that keeps memories somewhere other than
+`config.kv.memory.*` (bd 1.1.2's place). It cannot see a gap whose two ends are
+right: `dev/verify-dolt-history.py` checks the intermediate memory bodies and
+issue texts against `dolt_history_*`. A `.beads` holding both an embedded and a
+server-mode Dolt store is refused until the repository is named. `-o` refuses an existing file: on
 a store that is already cairn, the history goes into its events file by a
 splice, never written over it.
 

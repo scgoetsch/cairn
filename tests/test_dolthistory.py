@@ -106,8 +106,10 @@ class ReaderTest(unittest.TestCase):
     EXPORT = [
         {"_type": "issue", "id": "t-1", "title": "second title", "description": "d",
          "notes": "n1\nn2 caf\u00e9", "status": "closed", "close_reason": "done",
-         "closed_at": "2026-05-01T10:08:00Z", "priority": 2},
-        {"_type": "issue", "id": "t-1.1", "title": "child", "status": "open"},
+         "closed_at": "2026-05-01T10:08:00Z", "priority": 2, "issue_type": "task",
+         "created_at": "2026-05-01T10:01:00Z"},
+        {"_type": "issue", "id": "t-1.1", "title": "child", "status": "open", "priority": 2,
+         "issue_type": "task"},
         {"_type": "memory", "key": "m", "value": "three"},
     ]
 
@@ -183,6 +185,19 @@ class ReaderTest(unittest.TestCase):
                 self.read(export=export)
         with self.assertRaises(dolthistory.HistoryError):
             self.read(export=[*self.EXPORT, {"_type": "memory", "key": "new", "value": "x"}])
+        for gone in range(3):                       # Dolt has it, the export does not
+            with self.assertRaises(dolthistory.HistoryError, msg=str(gone)):
+                self.read(export=[r for i, r in enumerate(self.EXPORT) if i != gone])
+        export = [dict(r) for r in self.EXPORT]
+        del export[0]["issue_type"]                 # an omitted field is an empty one
+        with self.assertRaises(dolthistory.HistoryError):
+            self.read(export=export)
+
+    def test_an_embedded_and_a_server_store_side_by_side_are_refused(self):
+        self.build()
+        shutil.copytree(self.repo, self.tmp / ".beads" / "dolt" / "workspace")
+        with self.assertRaises(dolthistory.HistoryError):
+            self.read(export=self.EXPORT)
 
     def test_every_bd_events_row_is_accounted_for(self):
         """Acceptance (3): each row of bd's events table, recounted from Dolt itself."""
@@ -190,11 +205,12 @@ class ReaderTest(unittest.TestCase):
         self.commit("UPDATE labels SET label = label WHERE issue_id = 't-1'")   # no change
         _, manifest = self.read(export=self.EXPORT)
         rows = json.loads(self.dolt("sql", "-r", "json", "-q",
-                                    "SELECT COUNT(*) AS n FROM events"))["rows"][0]["n"]
+                                    "SELECT COUNT(*) AS n FROM dolt_diff_events "
+                                    "WHERE to_commit <> 'WORKING'"))["rows"][0]["n"]
         counted = sum(n for kinds in manifest["bd_events"].values() for n in kinds.values())
         self.assertEqual(counted, rows)
         self.assertEqual(manifest["bd_events"]["updated"]
-                         .get("its commit changed nothing this reader carries"), 1)
+                         .get("not imported; its commit changed nothing this reader carries"), 1)
 
     def test_a_re_created_issue_starts_a_new_notes_chain(self):
         self.commit("INSERT INTO issues (id, title, status, priority, issue_type) VALUES "

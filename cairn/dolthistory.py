@@ -82,6 +82,13 @@ def dolt_copy(source: Path, dolt: str = "dolt") -> Iterator[Tuple[Path, Query]]:
         raise DoltError(f"dolt CLI not found ({dolt}); bd ships none: install a dolt "
                         "release and pass --dolt PATH")
     repo = find_dolt_repo(source)
+    beads = source.resolve()
+    beads = beads / ".beads" if (beads / ".beads").is_dir() else beads
+    both = [d for d in ("embeddeddolt", "dolt") if (beads / d).is_dir()
+            and any((p / ".dolt").is_dir() for p in (beads / d).iterdir())]
+    if len(both) > 1:
+        raise HistoryError(f"{beads} holds an embedded and a server-mode Dolt store; name the "
+                           "repository of the one bd uses now")
     with tempfile.TemporaryDirectory(prefix="cairn-dolt-") as tmp:
         copy = Path(tmp) / "repo"
         shutil.copytree(repo, copy, symlinks=False)   # a link would still reach the live store
@@ -345,8 +352,8 @@ def read_history(query: Query, *, export: Optional[Sequence[Dict[str, Any]]] = N
     for e in r.bd_events:
         kind = e.get("to_event_type") or e.get("from_event_type") or "?"
         if e["diff_type"] == "added":
-            how = ("its commit is carried as events" if per_commit[e["to_commit"]]
-                   else "its commit changed nothing this reader carries")
+            how = ("not imported; its commit's changes are carried" if per_commit[e["to_commit"]]
+                   else "not imported; its commit changed nothing this reader carries")
         else:
             how = f"{e['diff_type']} from bd's events table (not carried)"
         disposition[kind][how] += 1
@@ -359,7 +366,8 @@ def read_history(query: Query, *, export: Optional[Sequence[Dict[str, Any]]] = N
         "the order of changes inside one commit (events of one commit are in table, then "
         "column order)",
         f"the Dolt committer ({', '.join(m['committers'])}): never copied into actor",
-        "bd's events table as rows: read for the actor of each commit only",
+        *(["bd's events table as rows: read for the actor of each commit only"]
+          if "events" in tables else []),
         "changes made between two commits (only committed states exist)",
     ]
     return out, m
@@ -371,23 +379,30 @@ def _check_last_state(export: Sequence[Dict[str, Any]],
     """The history must end where the export is: else the copy is stale, the log has gaps, or
     this bd keeps something where the reader does not look. Refuse, naming the first few."""
     wrong: List[str] = []
+    seen_issues, seen_memories = set(), set()
     for row in export:
         if row.get("_type") == "memory":
             key = row.get("key")
+            seen_memories.add(key)
             if key not in last_memory:
                 wrong.append(f"memory {key}: no Dolt history under config.{MEMORY_PREFIX}*")
             elif last_memory[key] != row.get("value"):
                 wrong.append(f"memory {key}: the last body in Dolt differs from the export")
         elif row.get("_type", "issue") == "issue":
             issue_id = row.get("id")
+            seen_issues.add(issue_id)
             state = last_issue.get(issue_id)
             if state is None:
                 wrong.append(f"issue {issue_id}: no Dolt history")
                 continue
-            for col in columns:
-                if col in row and column_value(col, _export_value(col, row[col])) != state[col]:
+            for col in columns:          # bd's export omits an empty field: absent is empty
+                if column_value(col, _export_value(col, row.get(col))) != state[col]:
                     wrong.append(f"issue {issue_id}: {col} in Dolt differs from the export")
                     break
+    wrong += [f"issue {i}: in Dolt, not in the export" for i, state in sorted(last_issue.items())
+              if state is not None and i not in seen_issues]
+    wrong += [f"memory {k}: in Dolt, not in the export" for k, body in sorted(last_memory.items())
+              if body is not None and k not in seen_memories]
     if wrong:
         raise HistoryError(f"the Dolt history does not end at the export ({len(wrong)} "
                            f"difference(s); first: {'; '.join(wrong[:3])}). Use the export and "
