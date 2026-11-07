@@ -579,7 +579,10 @@ class Writer:
         supersedes is not a candidate: that is the documented way to replace one.
         A related body that links to no memory comes back with the keys worth
         linking to. Rewriting the same key replaces silently, as bd does; the
-        event row is the record of what was there."""
+        event row is the record of what was there: `old_value` carries the body
+        that was replaced (null for a new key, and for a rewrite with the same
+        body, where old_hash equals new_hash). bd kept those bodies only in
+        Dolt's history, where no bd verb reached them (workspace-7m8.5.2)."""
         if not key or not key.strip():
             raise WriteRefused("remember needs --key: keyless memories cannot be found, "
                                "deduplicated or updated")
@@ -613,9 +616,11 @@ class Writer:
                 self.conn.execute(
                     "UPDATE memories SET value = ?, body_hash = ?, updated_at = ? WHERE key = ?",
                     (value, body_hash(value), now, key))
+            changed = old is not None and old["value"] != value
             self._event(now, "memory_set",
                         {"old_hash": old["body_hash"] if old else None,
-                         "new_hash": body_hash(value)}, memory_key=key)
+                         "new_hash": body_hash(value),
+                         "old_value": old["value"] if changed else None}, memory_key=key)
             self._rederive_edges()
         return old is None, related, (near if short and not force else None)
 
@@ -628,6 +633,7 @@ class Writer:
             self.conn.execute(
                 "INSERT OR REPLACE INTO memory_tombstones(key, first_seen, deleted_at) "
                 "VALUES (?, ?, ?)", (key, old["created_at"], now))
-            self._event(now, "memory_deleted", {"old_hash": old["body_hash"]}, memory_key=key)
+            self._event(now, "memory_deleted",
+                        {"old_hash": old["body_hash"], "old_value": old["value"]}, memory_key=key)
             self._rederive_edges()
         return old["value"]

@@ -395,6 +395,14 @@ deliberate differences below), `cairn check` its hard link check, and the
 `created_at` / `updated_at` columns and `memory_tombstones` its ledger. Its
 `rank`, `lineage`, `related` and `graph` have no cairn verb.
 
+A memory's earlier versions are in its events: `memory_set` and
+`memory_deleted` carry the body they replaced as `old_value` (since 0.4.1;
+before that only its hash, so a version written under 0.4.0 is gone unless a
+commit of `memories.jsonl` caught it). `old_value` is null for a new key and
+for a rewrite with the same body. The events export is tracked in git, so a
+fresh checkout gets every version back. bd kept them only in Dolt's history,
+where no bd verb reached them.
+
 ## Known limits
 
 - A shadow is read-only and uses SQLite's default journal mode (it is

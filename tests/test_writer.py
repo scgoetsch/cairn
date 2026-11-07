@@ -440,6 +440,30 @@ class MemoryTest(WritableCase):
             "SELECT kind FROM events WHERE memory_key = 'mem-one' ORDER BY rowid")]
         self.assertEqual(kinds, ["memory_set", "memory_set", "memory_deleted"])
 
+    def test_memory_events_carry_the_body_they_replaced(self):
+        import json
+        self.w("remember", "--key", "mem-v", "first body")
+        self.w("remember", "--key", "mem-v", "first body")      # same body: nothing replaced
+        self.w("remember", "--key", "mem-v", "second body")
+        self.w("forget", "mem-v")
+        conn = self.mem()
+        rows = [(r[0], json.loads(r[1])) for r in conn.execute(
+            "SELECT kind, data FROM events WHERE memory_key = 'mem-v' ORDER BY rowid")]
+        self.assertEqual([k for k, _ in rows],
+                         ["memory_set", "memory_set", "memory_set", "memory_deleted"])
+        self.assertIsNone(rows[0][1]["old_value"], "a new key replaced nothing")
+        self.assertIsNone(rows[1][1]["old_value"], "the same body again replaced nothing")
+        self.assertEqual(rows[1][1]["old_hash"], rows[1][1]["new_hash"])
+        self.assertEqual(rows[2][1]["old_value"], "first body")
+        self.assertEqual(rows[3][1]["old_value"], "second body")
+        # The tracked export carries them: a fresh checkout gets every version back.
+        code, out, err = self.cli("export", "--events")
+        self.assertEqual(code, 0, err)
+        exported = [json.loads(line) for line in out.splitlines()]
+        self.assertEqual([e["data"].get("old_value") for e in exported
+                          if e.get("memory_key") == "mem-v"],
+                         [None, None, "first body", "second body"])
+
     def test_remember_without_key_is_refused(self):
         code, _, err = self.cli("remember", "body", "--actor", "x")
         self.assertEqual(code, 2)
