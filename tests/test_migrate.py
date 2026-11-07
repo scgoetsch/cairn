@@ -294,6 +294,57 @@ class EventsExportTest(StoreCase):
         self.assertTrue(later.startswith(out))
         self.assertEqual(len(later.splitlines()), len(rows) + 1)
 
+    def test_memory_versions_survive_a_rebuild_and_old_shape_rows_import(self):
+        """workspace-7m8.5.2: memory_set and memory_deleted carry the replaced body as
+        old_value. A 0.4.0 file holds only its hash: that shape, and a file mixing both, import
+        and re-export byte for byte; a rebuilt clone has every version, escapes included."""
+        live = self.live()
+        v1 = 'one "quoted" <a&b>\nsecond line   café'
+        self.w(live, "remember", "--key", "m", v1)
+        self.w(live, "remember", "--key", "m", "two")
+        self.w(live, "remember", "--key", "m", "three")
+        self.w(live, "forget", "m")
+        self.w(live, "remember", "--key", "m", "four")       # a second life of the key
+        code, out, err = self.cli("export", "--events", cwd=live)
+        self.assertEqual(code, 0, err)
+        lines = out.split("\n")[:-1]
+        for line in lines:
+            self.assertTrue(line.startswith('{"_type":"event",'), line[:40])
+        rows = [r for r in map(json.loads, lines) if r["memory_key"] == "m"]
+        self.assertEqual([r["kind"] for r in rows],
+                         ["memory_set"] * 3 + ["memory_deleted", "memory_set"])
+        self.assertEqual([r["data"]["old_value"] for r in rows], [None, v1, "two", "three", None])
+        self.assertTrue(all("old_hash" in r["data"] for r in rows), "old_hash stays")
+        self.assertEqual([r["data"]["old_hash"] is None for r in rows],
+                         [True, False, False, False, True], "old_hash null is the create signal")
+
+        # A rebuilt clone carries the versions.
+        alloc, events = (self.workspace / n for n in ("allocator.json", "events.jsonl"))
+        (self.workspace / "both.jsonl").write_text(self.cli("export", "--all", cwd=live)[1])
+        self.assertEqual(self.cli("export", "--allocator", "-o", str(alloc), cwd=live)[0], 0)
+        self.assertEqual(self.cli("export", "--events", "-o", str(events), cwd=live)[0], 0)
+        fresh = self.workspace / "fresh"
+        fresh.mkdir()
+        code, _, err = self.cli("init", "-p", "t", "--from", str(self.workspace / "both.jsonl"),
+                                "--seed", str(alloc), "--events", str(events), cwd=fresh)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.cli("export", "--events", cwd=fresh)[1], out)
+
+        # A file written under 0.4.0 has no old_value; one that mixes both shapes imports too,
+        # and comes back as it went in.
+        first = next(l for l in lines if '"memory_key":"m"' in l)
+        self.assertIn(',"old_value":null', first)
+        mixed = out.replace(first, first.replace(',"old_value":null', ""), 1)
+        self.assertNotEqual(mixed, out)
+        (self.workspace / "mixed.jsonl").write_text(mixed)
+        older = self.workspace / "older"
+        older.mkdir()
+        code, _, err = self.cli("init", "-p", "t", "--from", str(self.workspace / "both.jsonl"),
+                                "--seed", str(alloc), "--events", str(self.workspace / "mixed.jsonl"),
+                                cwd=older)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.cli("export", "--events", cwd=older)[1], mixed)
+
     def test_events_is_a_file_of_its_own(self):
         live = self.live()
         for extra in (("--all",), ("--include-memories",), ("--allocator",)):

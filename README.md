@@ -152,7 +152,10 @@ The database is git-ignored. What rebuilds it is the two JSONL exports plus two 
 format has no rows for: `cairn export --allocator -o .beads/allocator.json` writes every id ever
 issued and each parent's last child number, in the seed format; `cairn export --events -o
 .beads/events.jsonl` writes the history, one JSON line per event, oldest first, every key present
-(`id`, `kind`, `issue_id`, `memory_key`, `actor`, `created_at`, `data` as an object). Two exports of
+(`id`, `kind`, `issue_id`, `memory_key`, `actor`, `created_at`, `data` as an object). `data` is
+opaque to import and export: `memory_set` and `memory_deleted` rows written under 0.4.0 have no
+`old_value` (see Memory links), and a file that mixes both shapes imports and re-exports byte for
+byte (`EventsExportTest`). Two exports of
 one store are equal and a new event lands at the end, so git sees an append. A fresh checkout
 rebuilds with `cairn init -p P --from <issues + memories> --seed .beads/allocator.json --events
 .beads/events.jsonl` without reissuing an id and with its history (`FreshCheckoutTest`,
@@ -399,9 +402,13 @@ A memory's earlier versions are in its events: `memory_set` and
 `memory_deleted` carry the body they replaced as `old_value` (since 0.4.1;
 before that only its hash, so a version written under 0.4.0 is gone unless a
 commit of `memories.jsonl` caught it). `old_value` is null for a new key and
-for a rewrite with the same body. The events export is tracked in git, so a
-fresh checkout gets every version back. bd kept them only in Dolt's history,
-where no bd verb reached them.
+for a rewrite with the same body; the create signal is `old_hash` null, not
+`old_value` null. The live body is in `memories.jsonl`; every replaced one is
+in `events.jsonl`, both tracked in git, so a fresh checkout gets every version
+back. That includes `forget`: the body a `forget` removes from `memories.jsonl`
+lands in the events file at the next export, so forgetting a memory does not
+take its text out of the checkout (it never took it out of git history). bd
+kept earlier versions only in Dolt's history, where no bd verb reached them.
 
 ## Known limits
 
