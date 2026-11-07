@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from . import admission, links, timeutil
+from .eventdata import field_change_data
 from .importer import ISSUE_COLUMNS, body_hash
 from .queries import BLOCKING_TYPE, PARENT_TYPE, Snapshot
 from .store import STATUSES, get_meta
@@ -156,7 +157,8 @@ class Writer:
     def _set(self, now: str, row: sqlite3.Row, changes: Dict[str, Any],
              reason: Optional[str] = None) -> Dict[str, Any]:
         """Apply column changes; one field_change event per column that changed
-        (bd's audit vocabulary). updated_at moves only when something changed."""
+        (bd's audit vocabulary; a notes append records only its tail, eventdata).
+        updated_at moves only when something changed."""
         # Column names cannot be bound as parameters, so they are checked against the schema's.
         unknown = sorted(set(changes) - _SETTABLE - {"updated_at"})
         if unknown:
@@ -168,7 +170,7 @@ class Writer:
         self.conn.execute(f"UPDATE issues SET {sets}, updated_at = ? WHERE id = ?",  # noqa: S608 — names checked against _SETTABLE, values bound
                           (*changed.values(), now, row["id"]))
         for col, new in changed.items():
-            data = {"field": col, "old_value": row[col], "new_value": new}
+            data = field_change_data(col, row[col], new)
             if reason is not None and col == "status":
                 data["reason"] = reason
             self._event(now, "field_change", data, issue_id=row["id"])

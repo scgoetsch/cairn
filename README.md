@@ -155,7 +155,13 @@ issued and each parent's last child number, in the seed format; `cairn export --
 (`id`, `kind`, `issue_id`, `memory_key`, `actor`, `created_at`, `data` as an object). `data` is
 opaque to import and export: `memory_set` and `memory_deleted` rows written under 0.4.0 have no
 `old_value` (see Memory links), and a file that mixes both shapes imports and re-exports byte for
-byte (`EventsExportTest`). Two exports of
+byte (`EventsExportTest`). A column change is `field_change` with `field`, `old_value` and
+`new_value`, except a notes append (`note`, `update --append-notes`): since 0.4.2 that is
+`{"field": "notes", "appended": <the added text>}`, because the full shape repeated the whole notes
+field twice in every event and the file grew with the square of the notes on a long issue. The text
+after an append is the text before it plus `appended` (`cairn/eventdata.py`); replacing the notes
+with `update --notes` keeps the full shape. Rows written before 0.4.2 are all the full shape and
+import as they are. Two exports of
 one store are equal and a new event lands at the end, so git sees an append. A fresh checkout
 rebuilds with `cairn init -p P --from <issues + memories> --seed .beads/allocator.json --events
 .beads/events.jsonl` without reissuing an id and with its history (`FreshCheckoutTest`,

@@ -136,6 +136,34 @@ class FieldTest(WritableCase):
         self.assertEqual(fields.count("notes"), 3)
         self.assertIn("title", fields)
 
+    def test_a_notes_append_records_only_its_tail(self):
+        """workspace-7m8.5.8: an append writes {field, appended}; setting or replacing the notes
+        writes the full shape; the chain of events rebuilds the live text."""
+        from cairn.eventdata import apply_field_change
+        issue_id = self.new("x")
+        self.w("update", issue_id, "--notes", "N1")              # from nothing: full shape
+        self.w("update", issue_id, "--append-notes", "N2")
+        self.w("note", issue_id, 'N3 "quoted" <a&b>\nline two')
+        self.w("update", issue_id, "--notes", "replaced")        # not an append: full shape
+        self.w("note", issue_id, "N4")
+        notes = [json.loads(e["data"]) for e in self.events(issue_id)
+                 if e["kind"] == "field_change" and json.loads(e["data"])["field"] == "notes"]
+        self.assertEqual(notes, [
+            {"field": "notes", "old_value": None, "new_value": "N1"},
+            {"field": "notes", "appended": "\nN2"},
+            {"field": "notes", "appended": '\nN3 "quoted" <a&b>\nline two'},
+            {"field": "notes", "old_value": 'N1\nN2\nN3 "quoted" <a&b>\nline two',
+             "new_value": "replaced"},
+            {"field": "notes", "appended": "\nN4"},
+        ])
+        text = None
+        for data in notes:
+            text = apply_field_change(text, data)
+        self.assertEqual(text, self.row(issue_id)["notes"])
+        self.assertEqual(text, "replaced\nN4")
+        with self.assertRaises(ValueError):
+            apply_field_change(None, notes[1])
+
     def test_an_update_that_changes_nothing_leaves_no_event(self):
         issue_id = self.new("x")
         self.w("update", issue_id, "--title", "x")

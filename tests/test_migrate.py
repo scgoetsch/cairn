@@ -345,6 +345,50 @@ class EventsExportTest(StoreCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.cli("export", "--events", cwd=older)[1], mixed)
 
+    def test_notes_appends_survive_a_rebuild_and_full_shape_rows_import(self):
+        """workspace-7m8.5.8: a notes append exports as {field, appended}; a rebuilt clone
+        re-exports it byte for byte, and a file holding the same change in the pre-0.4.2 full
+        shape, mixed with the new one, imports and comes back as it went in."""
+        from cairn.queries import go_json
+        live = self.live()
+        issue_id = self.w(live, "create", "--silent", "--title", "x").strip()
+        self.w(live, "update", issue_id, "--notes", "first")
+        self.w(live, "note", issue_id, 'second "q" <a&b>')
+        self.w(live, "note", issue_id, "third")
+        code, out, err = self.cli("export", "--events", cwd=live)
+        self.assertEqual(code, 0, err)
+        lines = out.split("\n")[:-1]
+        tail = next(l for l in lines if '"appended"' in l)
+        self.assertEqual(json.loads(tail)["data"], {"field": "notes",
+                                                    "appended": '\nsecond "q" <a&b>'})
+
+        alloc, events = (self.workspace / n for n in ("allocator.json", "events.jsonl"))
+        (self.workspace / "both.jsonl").write_text(self.cli("export", "--all", cwd=live)[1])
+        self.assertEqual(self.cli("export", "--allocator", "-o", str(alloc), cwd=live)[0], 0)
+        events.write_text(out)
+        fresh = self.workspace / "fresh"
+        fresh.mkdir()
+        code, _, err = self.cli("init", "-p", "t", "--from", str(self.workspace / "both.jsonl"),
+                                "--seed", str(alloc), "--events", str(events), cwd=fresh)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.cli("export", "--events", cwd=fresh)[1], out)
+
+        # The same append as 0.4.1 wrote it (full shape), in a file with new-shape rows.
+        row = json.loads(tail)
+        row["data"] = {"field": "notes", "new_value": 'first\nsecond "q" <a&b>',
+                       "old_value": "first"}
+        mixed = out.replace(tail, go_json(row), 1)
+        self.assertNotEqual(mixed, out)
+        self.assertEqual(mixed.count('"appended"'), 1, "one row of each shape")
+        (self.workspace / "mixed.jsonl").write_text(mixed)
+        older = self.workspace / "older"
+        older.mkdir()
+        code, _, err = self.cli("init", "-p", "t", "--from", str(self.workspace / "both.jsonl"),
+                                "--seed", str(alloc), "--events", str(self.workspace / "mixed.jsonl"),
+                                cwd=older)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.cli("export", "--events", cwd=older)[1], mixed)
+
     def test_events_is_a_file_of_its_own(self):
         live = self.live()
         for extra in (("--all",), ("--include-memories",), ("--allocator",)):
