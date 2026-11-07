@@ -435,13 +435,9 @@ def merge(dolt: List[Dict[str, Any]], earlier: List[Dict[str, Any]],
             when = timeutil.parse(e["created_at"])
             d = e["data"]
 
-            def same(o: Any, n: Any) -> bool:
-                if "appended" in d:          # the log holds the full shape of the same append
-                    return o is not None and n == o + d["appended"]
-                return o == comparable(d.get("old_value")) and n == comparable(d.get("new_value"))
             match = next((i for t, o, n, i in index.get((e["issue_id"], d["field"]), ())
                           if i not in used and when is not None and abs(t - when) <= SAME_CHANGE
-                          and same(o, n)), None)
+                          and _same_change(d, o, n)), None)
             if match is not None:
                 used.add(match)
                 manifest["dropped"]["field_change already in the earlier history"] += 1
@@ -462,6 +458,14 @@ def merge(dolt: List[Dict[str, Any]], earlier: List[Dict[str, Any]],
     for e in merged:
         e.pop("_order", None)
     return merged
+
+
+def _same_change(data: Dict[str, Any], old: Optional[str], new: Optional[str]) -> bool:
+    """Whether a Dolt field_change `data` is the change a log row records as old -> new (both
+    as `comparable` text). The log has no append shape: a Dolt append matches old + tail."""
+    if "appended" in data:
+        return old is not None and new == old + data["appended"]
+    return old == comparable(data.get("old_value")) and new == comparable(data.get("new_value"))
 
 
 def write_events(events: List[Dict[str, Any]], path: Path) -> None:
