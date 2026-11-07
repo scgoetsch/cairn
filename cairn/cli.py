@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import PROG, __version__, doltseed, prime, shadow, sync as syncmod, timeutil
-from .importer import ENV_PREFIXES, SourceError, build_store, build_writable
+from .importer import ENV_PREFIXES, SourceError, build_store, build_writable, read_jsonl
 from .queries import (LINKED_OMITS, Snapshot, check, events_lines, export_lines, memories,
                       recall, stats)
 from .store import (GITIGNORE, STORE_DIRNAME, StoreError, db_path, find_store_dir,
@@ -687,6 +687,36 @@ def cmd_seed_from_dolt(args, start: Path) -> int:
     return 0
 
 
+def cmd_history_from_dolt(args, start: Path) -> int:
+    from . import dolthistory
+    export_keys: List[str] = []
+    if args.export:
+        export_keys = [r["key"] for _, r in read_jsonl(Path(args.export))
+                       if r.get("_type") == "memory" and isinstance(r.get("key"), str)]
+    try:
+        with dolthistory.dolt_copy(Path(args.source), args.dolt) as (_, query):
+            events, manifest = dolthistory.read_history(query, export_memory_keys=export_keys)
+    except doltseed.DoltError as exc:
+        raise Refused(str(exc)) from exc
+    earlier = (dolthistory.interactions_events(Path(args.interactions))
+               if args.interactions else [])
+    merged = dolthistory.merge(events, earlier, manifest)
+    manifest["written"] = {"events": len(merged), "from_dolt": len(merged) - len(earlier),
+                           "from_interactions": len(earlier)}
+    dolthistory.write_events(merged, Path(args.output))
+    text = dolthistory.manifest_json(manifest) + "\n"
+    if args.manifest:
+        Path(args.manifest).write_text(text, encoding="utf-8")
+    else:
+        sys.stderr.write(text)
+    print(f"History written to {args.output}: {len(merged)} events ({len(merged) - len(earlier)} "
+          f"from Dolt, {len(earlier)} from interactions); load it with "
+          f"`cairn init --from EXPORT --seed SEED --events {args.output}`", file=sys.stderr)
+    for warning in manifest["warnings"]:
+        print(f"⚠ {warning}", file=sys.stderr)
+    return 0
+
+
 def read_text_arg(path: Optional[str]) -> Optional[str]:
     if path is None:
         return None
@@ -1021,6 +1051,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dolt", default="dolt", help="dolt executable (bd ships none)")
     p.add_argument("-o", "--output", help="write the seed here (default: stdout)")
     p.set_defaults(func=cmd_seed_from_dolt)
+
+    p = sub.add_parser("history-from-dolt", help="read bd's history (memory versions, issue "
+                                                 "changes, deletions) from a copy of its Dolt "
+                                                 "store as an events file for init --events")
+    p.add_argument("source", help="the .beads directory or the Dolt repository in it")
+    p.add_argument("--dolt", default="dolt", help="dolt executable (bd ships none)")
+    p.add_argument("--interactions", help="bd interactions.jsonl, merged in by time")
+    p.add_argument("--export", help="the bd export (`bd export --all`): every memory in it "
+                                    "must have a Dolt history, or the read failed")
+    p.add_argument("-o", "--output", required=True, help="the events file to write")
+    p.add_argument("--manifest", help="write what was carried and left behind here "
+                                      "(default: stderr)")
+    p.set_defaults(func=cmd_history_from_dolt)
 
     def issue_fields(w: argparse.ArgumentParser) -> None:
         w.add_argument("-d", "--description")

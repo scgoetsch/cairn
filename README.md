@@ -43,6 +43,7 @@ cairn prime [--budget BYTES]         # default 10000: what Claude Code shows of 
 cairn export [--include-memories | --all | --allocator | --events] [-o FILE]
 cairn import FILE [--interactions F] [--ledger F] [--hot F]   # build from files, no bd
 cairn seed-from-dolt BEADS_DIR [--dolt PATH] [-o FILE]        # allocator seed, see below
+cairn history-from-dolt BEADS_DIR -o FILE [--interactions F] [--export F] [--manifest F]
 cairn migrate                                                 # writable store -> this schema
 ```
 
@@ -85,8 +86,10 @@ Memory links are a projection of the bodies: `remember` and `forget` re-derive
 ```bash
 cairn seed-from-dolt .beads --dolt PATH/TO/dolt -o seed.json   # read-only, on a copy
 bd export --all -o bd.jsonl
-cairn init -p proj --from bd.jsonl --seed seed.json \
-           --interactions .beads/interactions.jsonl --ledger .beads/memgraph-ledger.json
+cairn history-from-dolt .beads --dolt PATH/TO/dolt --interactions .beads/interactions.jsonl \
+           --export bd.jsonl -o history.jsonl --manifest manifest.json   # read-only, on a copy
+cairn init -p proj --from bd.jsonl --seed seed.json --events history.jsonl \
+           --ledger .beads/memgraph-ledger.json
 cairn migrate                     # later: bring a writable store to a newer schema
 ```
 
@@ -102,6 +105,30 @@ its database, so the seed comes from Dolt: `seed-from-dolt` copies the Dolt
 repository to a temporary directory and reads, from the copy, every id in the
 history of `issues` and bd's `child_counters`. bd embeds Dolt and ships no CLI;
 any dolt release that reads the store works (measured with 2.4.2 on bd 1.1.2).
+
+bd keeps its history only in Dolt: every earlier body of a memory, every earlier
+title, description and note, who changed what. No export carries it.
+`history-from-dolt` reads it, from a copy, through Dolt's `dolt_diff_<table>`
+tables, so only changes leave Dolt, and writes an events file for `init
+--events`: issue creations, column changes (`field_change`; a notes append as
+`appended`), memory versions (`memory_set` with the replaced body as
+`old_value`) and deletions, labels, dependencies and comments. Each event is
+dated by its Dolt commit, carries `data.dolt_commit`, has the id
+`dolt-<hash>` (two runs give the same file), and takes its actor from the row
+bd wrote to its `events` table in that commit. `--interactions` merges bd's
+field-change log in by time and keeps a change both sources hold once, from
+the log. `--export` names the memories that must have a history: if the export
+has memories and Dolt has none under `config.kv.memory.*` (where bd 1.1.2
+keeps them), the read fails rather than write a history without them.
+
+The manifest says what was read, carried and dropped, and what stays in Dolt
+whatever the reader does: the commit graph (hashes and dates ride along, parent
+links and messages do not), the order of changes inside one commit, the Dolt
+committer (never used as the actor), bd's `events` rows themselves, changes
+between two commits, issue columns and tables cairn has no place for (named).
+A history with merge commits is refused. `dev/verify-dolt-history.py` checks a
+written file against the Dolt copy: every memory body and every issue text
+value Dolt ever held must be recoverable from the file plus the export.
 
 ### Migrating from other bd versions
 
