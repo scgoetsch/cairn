@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from . import admission, links, timeutil
-from .eventdata import field_change_data
+from .eventdata import APPEND_FIELDS, field_change_data
 from .importer import ISSUE_COLUMNS, body_hash
 from .queries import BLOCKING_TYPE, PARENT_TYPE, Snapshot
 from .store import STATUSES, get_meta
@@ -148,6 +148,13 @@ class Writer:
             (f"ev-{uuid.uuid4().hex}", kind, issue_id, memory_key, self.actor, now,
              json.dumps(data, sort_keys=True)))
 
+    def _has_field_event(self, issue_id: str, field: str) -> bool:
+        """Whether the history already holds a field_change of `field` on this issue, so a
+        notes append can be rebuilt from the events before it (eventdata)."""
+        return self.conn.execute(
+            "SELECT 1 FROM events WHERE issue_id = ? AND kind = 'field_change' "
+            "AND json_extract(data, '$.field') = ? LIMIT 1", (issue_id, field)).fetchone() is not None
+
     def _issue(self, issue_id: str) -> sqlite3.Row:
         row = self.conn.execute("SELECT * FROM issues WHERE id = ?", (issue_id,)).fetchone()
         if row is None:
@@ -170,7 +177,9 @@ class Writer:
         self.conn.execute(f"UPDATE issues SET {sets}, updated_at = ? WHERE id = ?",  # noqa: S608 — names checked against _SETTABLE, values bound
                           (*changed.values(), now, row["id"]))
         for col, new in changed.items():
-            data = field_change_data(col, row[col], new)
+            data = field_change_data(col, row[col], new,
+                                     anchored=col not in APPEND_FIELDS
+                                     or self._has_field_event(row["id"], col))
             if reason is not None and col == "status":
                 data["reason"] = reason
             self._event(now, "field_change", data, issue_id=row["id"])

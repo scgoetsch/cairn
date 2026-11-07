@@ -15,10 +15,14 @@ from typing import Any, Dict, Optional
 APPEND_FIELDS = frozenset({"notes"})
 
 
-def field_change_data(field: str, old: Any, new: Any) -> Dict[str, Any]:
-    """The event data for `field` going from `old` to `new` (the caller has checked they differ)."""
-    if (field in APPEND_FIELDS and isinstance(old, str) and old and isinstance(new, str)
-            and len(new) > len(old) and new.startswith(old)):
+def field_change_data(field: str, old: Any, new: Any, *, anchored: bool = True) -> Dict[str, Any]:
+    """The event data for `field` going from `old` to `new` (the caller has checked they differ).
+    The rule is the prefix test, not the command: any write whose new text extends the old is an
+    append. `anchored` says an earlier event of this field already holds the text before `old`
+    can be rebuilt from: false for the first change of the field in the history (notes set by
+    `create`, or carried over from bd), which then keeps the full shape so the chain has a start."""
+    if (anchored and field in APPEND_FIELDS and isinstance(old, str) and old
+            and isinstance(new, str) and len(new) > len(old) and new.startswith(old)):
         return {"field": field, "appended": new[len(old):]}
     return {"field": field, "old_value": old, "new_value": new}
 

@@ -164,6 +164,47 @@ class FieldTest(WritableCase):
         with self.assertRaises(ValueError):
             apply_field_change(None, notes[1])
 
+    def notes_events(self, issue_id: str) -> List[Dict[str, Any]]:
+        return [d for d in (json.loads(e["data"]) for e in self.events(issue_id)
+                            if e["kind"] == "field_change") if d["field"] == "notes"]
+
+    def replay(self, issue_id: str) -> Any:
+        from cairn.eventdata import apply_field_change
+        text = None
+        for data in self.notes_events(issue_id):
+            text = apply_field_change(text, data)
+        return text
+
+    def test_the_first_notes_event_is_a_full_snapshot(self):
+        """Grok's review of 12ad7b3: notes set by create (or carried over from bd) are in no
+        event, so the first change of the field keeps the full shape and the chain has a start."""
+        issue_id = self.new("x", "--notes", "from create")
+        self.w("note", issue_id, "café ✓")
+        self.w("note", issue_id, "again")
+        self.assertEqual(self.notes_events(issue_id), [
+            {"field": "notes", "old_value": "from create", "new_value": "from create\ncafé ✓"},
+            {"field": "notes", "appended": "\nagain"},
+        ])
+        self.assertEqual(self.replay(issue_id), self.row(issue_id)["notes"])
+
+    def test_the_shape_follows_the_text_not_the_command(self):
+        issue_id = self.new("x")
+        self.w("note", issue_id, "abc")                            # from nothing: full
+        self.w("update", issue_id, "--notes", "abcdef")            # extends: an append
+        self.w("update", issue_id, "--notes", "abcdef more", "--append-notes", "z")  # one event
+        self.w("update", issue_id, "--notes", "")                  # cleared: full, to null
+        self.w("note", issue_id, "fresh")                          # from null: full
+        self.w("update", issue_id, "--append-notes", " ")          # whitespace tail kept
+        self.assertEqual(self.notes_events(issue_id), [
+            {"field": "notes", "old_value": None, "new_value": "abc"},
+            {"field": "notes", "appended": "def"},
+            {"field": "notes", "appended": " more\nz"},
+            {"field": "notes", "old_value": "abcdef more\nz", "new_value": None},
+            {"field": "notes", "old_value": None, "new_value": "fresh"},
+            {"field": "notes", "appended": "\n "},
+        ])
+        self.assertEqual(self.replay(issue_id), self.row(issue_id)["notes"])
+
     def test_an_update_that_changes_nothing_leaves_no_event(self):
         issue_id = self.new("x")
         self.w("update", issue_id, "--title", "x")

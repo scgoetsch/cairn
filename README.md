@@ -156,12 +156,16 @@ issued and each parent's last child number, in the seed format; `cairn export --
 opaque to import and export: `memory_set` and `memory_deleted` rows written under 0.4.0 have no
 `old_value` (see Memory links), and a file that mixes both shapes imports and re-exports byte for
 byte (`EventsExportTest`). A column change is `field_change` with `field`, `old_value` and
-`new_value`, except a notes append (`note`, `update --append-notes`): since 0.4.2 that is
-`{"field": "notes", "appended": <the added text>}`, because the full shape repeated the whole notes
-field twice in every event and the file grew with the square of the notes on a long issue. The text
-after an append is the text before it plus `appended` (`cairn/eventdata.py`); replacing the notes
-with `update --notes` keeps the full shape. Rows written before 0.4.2 are all the full shape and
-import as they are. Two exports of
+`new_value`, except a notes append: since 0.4.2 a notes change whose new text extends the old
+(`note`, `update --append-notes`, or an `update --notes` that happens to) is `{"field": "notes",
+"appended": <the added text>}`, because the full shape repeated the whole notes field twice in
+every event and the file grew with the square of the notes on a long issue. The text after an
+append is the text before it plus `appended` (`cairn/eventdata.py`). The first notes change of an
+issue keeps the full shape, since notes set by `create` or carried over from bd are in no event:
+replaying an issue's notes events from the start rebuilds the text, and a reader that starts in
+the middle of a run of appends has only the tails. Any other notes change (a replacement, a clear)
+keeps the full shape. Rows written before 0.4.2 are all the full shape and import as they are. Two
+exports of
 one store are equal and a new event lands at the end, so git sees an append. A fresh checkout
 rebuilds with `cairn init -p P --from <issues + memories> --seed .beads/allocator.json --events
 .beads/events.jsonl` without reissuing an id and with its history (`FreshCheckoutTest`,
