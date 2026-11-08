@@ -387,14 +387,6 @@ def import_into(conn: sqlite3.Connection, export_path: Path, *,
         report.warnings.append(
             f"memory {source}: unknown link type '{written}::' on [[{target}]] (stored as related)")
 
-    tombstones = 0
-    for key, entry in sorted(ledger.items()):
-        if entry.get("deleted_at") and key not in memories:
-            conn.execute(
-                "INSERT INTO memory_tombstones(key, first_seen, deleted_at) VALUES (?, ?, ?)",
-                (key, entry.get("first_seen"), entry.get("deleted_at")))
-            tombstones += 1
-
     events = 0
     if interactions_path is not None and interactions_path.is_file():
         for lineno, row in read_jsonl(interactions_path):
@@ -417,6 +409,18 @@ def import_into(conn: sqlite3.Connection, export_path: Path, *,
             events += 1
     if events_path is not None and events_path.is_file():
         events += import_events(conn, events_path)
+
+    # After every event is in (rowid order is the combined history): tombstones and the live
+    # memories' timestamps come from the memory events, the ledger fills what they never mention.
+    stones, stamps, replay_warnings = replay_memory_events(conn, ledger, set(memories))
+    report.warnings.extend(replay_warnings)
+    for key, first_seen, deleted_at in stones:
+        conn.execute("INSERT INTO memory_tombstones(key, first_seen, deleted_at) VALUES (?, ?, ?)",
+                     (key, first_seen, deleted_at))
+    tombstones = len(stones)
+    for key, (created, updated) in stamps.items():
+        conn.execute("UPDATE memories SET created_at = COALESCE(?, created_at), "
+                     "updated_at = COALESCE(?, updated_at) WHERE key = ?", (created, updated, key))
 
     dep_order = detect_dep_order([r for _, r in issue_rows])
     if dep_order is None:
@@ -441,6 +445,60 @@ def import_into(conn: sqlite3.Connection, export_path: Path, *,
         "events": events,
     }
     return report
+
+
+MemoryStamps = Dict[str, Tuple[Optional[str], Optional[str]]]
+
+
+def replay_memory_events(conn: sqlite3.Connection, ledger: Mapping[str, Any],
+                         live_keys: Set[str]) -> Tuple[List[Tuple[str, Optional[str], str]],
+                                                       MemoryStamps, List[str]]:
+    """Read the memory events back (gap-closure spec, section 4): the tombstones a rebuild
+    must carry, and the created_at / updated_at of the live memories, which bd's export
+    format (memories.jsonl) has no field for. Events win for any key they mention; the
+    ledger (bd-memgraph's snapshot at the cutover) fills keys they never mention.
+
+    A life starts at a memory_set whose old_hash is null (remember inserted the row); a life
+    whose first event updates (old_hash set) began before the events, so its created_at is
+    left to the import (None here). updated_at is the last memory_set of the current life.
+    Returns (tombstone rows, {key: (created_at, updated_at)} for live keys, warnings)."""
+    life_started: Dict[str, Optional[str]] = {}
+    last_set: Dict[str, str] = {}
+    deleted: Dict[str, Tuple[Optional[str], str]] = {}
+    seen: Set[str] = set()
+    for row in conn.execute("SELECT kind, memory_key, created_at, data FROM events "
+                            "WHERE kind IN ('memory_set', 'memory_deleted') ORDER BY rowid"):
+        key = row["memory_key"]
+        if not key:
+            continue
+        seen.add(key)
+        if row["kind"] == "memory_set":
+            created = json.loads(row["data"]).get("old_hash") is None
+            life_started.setdefault(key, row["created_at"] if created else None)
+            last_set[key] = row["created_at"]
+            deleted.pop(key, None)
+        else:
+            deleted[key] = (life_started.pop(key, None), row["created_at"])
+            last_set.pop(key, None)
+    stones: List[Tuple[str, Optional[str], str]] = []
+    warnings: List[str] = []
+    for key, (first_seen, deleted_at) in sorted(deleted.items()):
+        if key in live_keys:
+            warnings.append(f"memory {key} is in the export and its later history event is "
+                            "memory_deleted; keeping the export's copy, no tombstone")
+            continue
+        if first_seen is None:
+            first_seen = (ledger.get(key) or {}).get("first_seen")
+        stones.append((key, first_seen, deleted_at))
+    for key, entry in sorted(ledger.items()):
+        if entry.get("deleted_at") and key not in live_keys and key not in seen:
+            stones.append((key, entry.get("first_seen"), entry["deleted_at"]))
+    for key in sorted(seen - deleted.keys() - live_keys):
+        warnings.append(f"memory {key} has a memory_set event and is not in the export; "
+                        "no tombstone (the export has no deletion time)")
+    stamps: MemoryStamps = {key: (life_started.get(key), last_set.get(key))
+                            for key in live_keys & set(last_set)}
+    return stones, stamps, warnings
 
 
 def import_events(conn: sqlite3.Connection, path: Path) -> int:

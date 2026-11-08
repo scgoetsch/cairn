@@ -12,6 +12,7 @@ away (`| head`), quietly, as bd and any process killed by SIGPIPE.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import signal
@@ -22,7 +23,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from . import PROG, __version__, doltseed, prime, shadow, sync as syncmod, timeutil
+from . import PROG, __version__, doltseed, memgraph, prime, shadow, sync as syncmod, timeutil
 from .importer import ENV_PREFIXES, SourceError, build_store, build_writable, read_jsonl
 from .queries import (LINKED_OMITS, Snapshot, check, events_lines, export_lines,
                       history_events, memories, recall, stats)
@@ -301,6 +302,8 @@ def print_issue(snap: Snapshot, issue_id: str, obj: Dict[str, Any]) -> None:
 def cmd_memories(args, start: Path) -> int:
     conn = connect(start)
     rows = memories(conn, args.keyword)
+    if args.rank:
+        return print_rank(conn, args, {r["key"] for r in rows})
     if args.json:
         out: Dict[str, Any] = {r["key"]: r["value"] for r in rows}
         out["schema_version"] = 1          # bd includes this key; consumers strip it
@@ -318,6 +321,65 @@ def cmd_memories(args, start: Path) -> int:
         print()
     if not rows:
         print("  (none)")
+    return 0
+
+
+def print_rank(conn, args, keys) -> int:
+    """`memories --rank`: the link graph's ranking (cairn/memgraph.py), filtered to the keyword's
+    matches when one is given (the rank itself is over the whole graph)."""
+    try:
+        today = datetime.date.fromisoformat(args.today) if args.today else datetime.date.today()
+    except ValueError:
+        raise Refused(f"invalid --today '{args.today}' (expected YYYY-MM-DD)") from None
+    if not 0 <= args.recency_weight <= 1:
+        raise Refused(f"--recency-weight must be between 0 and 1, got {args.recency_weight}")
+    if args.half_life <= 0:
+        raise Refused(f"--half-life must be more than 0, got {args.half_life}")
+    ranked = [r for r in memgraph.rank(conn, today, half_life=args.half_life,
+                                       recency_weight=args.recency_weight) if r["key"] in keys]
+    if args.limit:
+        ranked = ranked[:args.limit]
+    if args.json:
+        emit_json(ranked)
+        return 0
+    print(f"{'score':>8}  {'deg':>3}  {'age':>5}  key")
+    for r in ranked:
+        age = "?" if r["age_days"] is None else f"{r['age_days']}d"
+        flag = "  [superseded]" if r["superseded"] else ""
+        print(f"{r['score']:8.4f}  {r['degree']:3d}  {age:>5}  {r['key']}{flag}")
+    if not ranked:
+        print("  (none)")
+    return 0
+
+
+def cmd_related(args, start: Path) -> int:
+    conn = connect(start)
+    if conn.execute("SELECT 1 FROM memories WHERE key = ?", (args.key,)).fetchone() is None:
+        print(f'no memory with key "{args.key}"', file=sys.stderr)
+        return 1
+    if args.depth < 1:
+        raise Refused(f"--depth must be 1 or more, got {args.depth}")
+    items = memgraph.related(conn, args.key, depth=args.depth)
+    if args.json:
+        emit_json(items)
+        return 0
+    bodies = {r["key"]: " ".join(r["value"].split()) for r in conn.execute(
+        "SELECT key, value FROM memories")}
+    print(f"Links of {args.key}")
+    for direction, title in (("out", "out (this memory links to)"), ("in", "in (linked from)")):
+        print(f"\n{title}:")
+        mine = [i for i in items if i["direction"] == direction]
+        for i in mine:
+            arrow = f"--{i['relation']}-->" if direction == "out" else f"<--{i['relation']}--"
+            if i["kind"] == "issue":
+                tail = " (issue)"
+            elif not i["exists"]:
+                tail = " (no such memory)"
+            else:
+                tail = f": {bodies[i['key']][:90]}"
+            print(f"{'    ' * i['level']}{arrow} {i['key']}{tail}")
+        if not mine:
+            print("    (none)")
     return 0
 
 
@@ -664,11 +726,14 @@ def cmd_sync(args, start: Path) -> int:
         raise Refused(str(exc)) from exc
     if args.json:
         emit_json({"state": result.state, "detail": result.detail, "rebuilt": result.rebuilt,
-                   "backup": str(result.backup) if result.backup else None})
+                   "backup": str(result.backup) if result.backup else None,
+                   "warnings": list(result.warnings)})
     elif not args.quiet:
         if result.rebuilt:
             kept = f"; the old database is {result.backup}" if result.backup else ""
             print(f"Synced {store} from {syncmod.exports_dir(store)} ({result.detail}){kept}")
+            for warning in result.warnings:      # after the Synced line: the prime hook matches it
+                print(f"⚠ {warning}")
         else:
             print(f"Nothing to do: {result.state}, {result.detail}")
     return 0
@@ -1049,9 +1114,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("ids", nargs="+", metavar="id")
     p.set_defaults(func=cmd_show)
 
-    p = sub.add_parser("memories", help="list or search memories")
+    p = sub.add_parser("memories", help="list or search memories (--rank: by the link graph)")
     p.add_argument("keyword", nargs="?")
+    p.add_argument("--rank", action="store_true",
+                   help="rank by links and recency, highest first (bd-memgraph's rank)")
+    p.add_argument("-n", "--limit", type=non_negative, default=0,
+                   help="with --rank: only the top N (0: all)")
+    p.add_argument("--half-life", type=float, default=90, help="with --rank: recency half-life, days")
+    p.add_argument("--recency-weight", type=float, default=0.5,
+                   help="with --rank: 0 = links only, 1 = links times recency")
+    p.add_argument("--today", help="with --rank: the reference date, YYYY-MM-DD")
     p.set_defaults(func=cmd_memories)
+
+    p = sub.add_parser("related", help="the links of one memory, out and in (--depth: walk them)")
+    p.add_argument("key")
+    p.add_argument("--depth", type=non_negative, default=1, help="hops to walk (default 1)")
+    p.set_defaults(func=cmd_related)
 
     p = sub.add_parser("recall", help="print one memory by key")
     p.add_argument("key")

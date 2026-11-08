@@ -39,6 +39,8 @@ cairn ready [--json] [-n N] [-p P1] [-t bug] [--parent ID] [--include-deferred]
 cairn list  [--status=in_progress] [--all] [--json] [-n N]
 cairn blocked | show ID... | stats | where | check
 cairn memories [keyword] | recall KEY
+cairn memories --rank [keyword] [-n N] [--half-life D] [--recency-weight W] [--json]
+cairn related KEY [--depth N] [--json]                      # a memory's links, out and in
 cairn history ID [--limit N] [--kind KIND] [--json]          # events of one issue, oldest first
 cairn history --memory KEY [--limit N] [--kind KIND] [--json]  # its events, each with the body it replaced
 cairn prime [--budget BYTES]         # default 10000: what Claude Code shows of a hook in full
@@ -234,9 +236,12 @@ so nobody claims work another clone already closed; reads still work and warn on
 --status` says which state it is (exit 1 behind, 2 diverged). The check that runs on every verb
 compares one line, where the two histories meet; `sync` compares them whole before it changes
 anything, under the store's write lock, and a write that was waiting for that lock refuses
-instead of landing in the replaced file. Not carried by a rebuild: memory tombstones (`forget`
-and the cutover write them; the exports do not hold them), so after one `check` names a link to a
-forgotten key as dangling without saying when it was deleted.
+instead of landing in the replaced file. What the four files have no field for, a rebuild takes
+from the memory events (since 0.7.0): memory tombstones from `memory_deleted`, so `check` names
+the deletion time of a forgotten key after a `sync`, and each memory's `created_at` (the
+`memory_set` that started its current life) and `updated_at` (its last `memory_set`). A ledger
+given to `init --ledger` only fills keys the events never mention. A rebuild prints its warnings
+after the `Synced` line (`--json`: `warnings`).
 
 `migrate` applies the numbered steps in `store.MIGRATIONS`. It holds the write
 lock, writes `cairn.db.v<N>.bak` first, runs every step in one transaction,
@@ -447,8 +452,18 @@ explains a link to a deleted key, and flags an issue with more than one parent.
 
 Under cairn these replace bd-memgraph: `remember` does its `evolve` (see the
 deliberate differences below), `cairn check` its hard link check, and the
-`created_at` / `updated_at` columns and `memory_tombstones` its ledger. Its
-`rank`, `lineage`, `related` and `graph` have no cairn verb.
+`created_at` / `updated_at` columns and `memory_tombstones` its ledger. Since
+0.7.0 `cairn memories --rank` is its `rank`: PageRank over the memory-to-memory
+links (damping 0.85), times recency (0.5 ** (age / half-life), age from the
+newest YYYY-MM-DD in the key or body or from `updated_at`, whichever is later;
+an undated memory counts 0.3), times 0.1 for a key some memory `supersedes`;
+same defaults (half-life 90 days, recency weight 0.5) and, on this repo's store,
+the same order as bd-memgraph except where `updated_at` is newer than the body's
+dates. `cairn related KEY` is its `related`, and `--depth N` walks the links N
+hops, which is what its `lineage` printed; issue links are listed, not walked.
+Not carried: `graph` (a DOT dump nothing reads) and `stats` (`cairn check` and
+`cairn stats` count the store; the link census was a curation aid nothing
+calls); a memory's versions are `cairn history --memory`.
 
 A memory's earlier versions are in its events: `memory_set` and
 `memory_deleted` carry the body they replaced as `old_value` (since 0.4.1;

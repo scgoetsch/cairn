@@ -341,6 +341,7 @@ class SyncResult:
     detail: str
     rebuilt: bool = False
     backup: Optional[Path] = None
+    warnings: Tuple[str, ...] = ()       # the rebuild's import warnings, as `init` prints them
 
 
 def sync(store_dir: Path, *, hot_path: Optional[Path] = None) -> SyncResult:
@@ -387,7 +388,7 @@ def sync(store_dir: Path, *, hot_path: Optional[Path] = None) -> SyncResult:
                     out.write(line + "\n")
         fresh = store_dir / f"{DB_FILENAME}.sync-{os.getpid()}"
         seed = beads / ALLOCATOR
-        build_writable(fresh, source, prefix, seed_path=seed if seed.is_file() else None,
+        report = build_writable(fresh, source, prefix, seed_path=seed if seed.is_file() else None,
                        events_path=beads / EVENTS if (beads / EVENTS).is_file() else None,
                        hot_path=hot_path if hot_path and hot_path.is_file() else None,
                        extra_prefixes=load_config(store_dir).get("issue_prefixes", []))
@@ -397,7 +398,7 @@ def sync(store_dir: Path, *, hot_path: Optional[Path] = None) -> SyncResult:
             for leftover in (fresh, Path(f"{fresh}-wal"), Path(f"{fresh}-shm")):
                 if leftover.exists():
                     leftover.unlink()
-    return SyncResult(state, detail, rebuilt=True, backup=backup)
+    return SyncResult(state, detail, rebuilt=True, backup=backup, warnings=tuple(report.warnings))
 
 
 def _swap_in(path: Path, fresh: Path) -> Optional[Path]:
