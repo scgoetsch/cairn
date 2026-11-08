@@ -35,14 +35,20 @@ from .importer import build_writable
 from .queries import event_object, events_lines, go_json
 from .store import DB_FILENAME, StoreError, db_path, get_meta, load_config, open_db, open_writable
 
-EXPORTS_DIRNAME = ".beads"
+EXPORTS_DIRNAME = ".beads"            # where they lived before 0.7.0 (bd's directory)
 ISSUES, MEMORIES, ALLOCATOR, EVENTS = "issues.jsonl", "memories.jsonl", "allocator.json", "events.jsonl"
+EXPORT_FILES = (ISSUES, MEMORIES, ALLOCATOR, EVENTS)
 BEHIND, DIVERGED, AHEAD, EQUAL, NO_FILE = "behind", "diverged", "ahead", "equal", "no-exports"
 EVENT_COLUMNS = "id, kind, issue_id, memory_key, actor, created_at, data"
 
 
 def exports_dir(store_dir: Path) -> Path:
-    """The tracked exports beside the store: `<checkout>/.beads/`."""
+    """The tracked exports: in the store directory itself (`<checkout>/.cairn/`, since 0.7.0)
+    when it holds any of the four files, else `<checkout>/.beads/`, where they were before. So a
+    pull that moves them moves every clone with it, and a clone that has not pulled the move yet
+    keeps reading the old place: no flag day."""
+    if any((store_dir / name).is_file() for name in EXPORT_FILES):
+        return store_dir
     return store_dir.parent / EXPORTS_DIRNAME
 
 
@@ -111,13 +117,18 @@ def merging(store_dir: Path) -> bool:
 
 
 def committed_lines(store_dir: Path, ref: str) -> Optional[List[str]]:
-    try:
-        out = subprocess.run(["git", "-C", str(store_dir.parent), "show",
-                              f"{ref}:{EXPORTS_DIRNAME}/{EVENTS}"],
-                             capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return [l for l in out.stdout.split("\n") if l] if out.returncode == 0 else None
+    """The events file as `ref` committed it: at the store directory's path (since 0.7.0) or,
+    in a commit from before the move, at `.beads/`."""
+    for where in (store_dir.name, EXPORTS_DIRNAME):
+        try:
+            out = subprocess.run(["git", "-C", str(store_dir.parent), "show",
+                                  f"{ref}:{where}/{EVENTS}"],
+                                 capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode == 0:
+            return [l for l in out.stdout.split("\n") if l]
+    return None
 
 
 def merge_holds_nothing_new(conn: sqlite3.Connection, store_dir: Path) -> bool:
@@ -271,7 +282,7 @@ def full_state(conn: sqlite3.Connection, store_dir: Path) -> Tuple[str, str]:
     """(relation, what differs), over the whole history."""
     tracked = file_lines(exports_dir(store_dir) / EVENTS)
     if not tracked:
-        return NO_FILE, f"no {EXPORTS_DIRNAME}/{EVENTS} beside the store"
+        return NO_FILE, f"no {EVENTS} in the store directory or in {EXPORTS_DIRNAME}/ beside it"
     store = events_lines(conn)
     state = relation(store, tracked)
     if state in (DIVERGED, BEHIND) and merge_holds_nothing_new(conn, store_dir):

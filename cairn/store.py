@@ -14,7 +14,9 @@ CONFIG_FILENAME = "config.json"
 REDIRECT_FILENAME = "redirect"
 # The store directory is ignored by git except for these two files: the database
 # and logs are derived, the configuration is not.
-GITIGNORE = "*\n!.gitignore\n!config.json\n"
+GITIGNORE = ("*\n!.gitignore\n!config.json\n"
+             # the tracked exports, when they live here (since 0.7.0; sync.exports_dir)
+             "!issues.jsonl\n!memories.jsonl\n!allocator.json\n!events.jsonl\n")
 SCHEMA_VERSION = 1
 # A writer waits this long for another writer's transaction before giving up.
 # Inside the shadow run's 15 s deadline and the session hooks' budgets.
@@ -232,10 +234,10 @@ def create_db(path: Path) -> sqlite3.Connection:
 def open_db(path: Path) -> sqlite3.Connection:
     """Open an existing store read-only. Read verbs never write."""
     if not path.is_file():
-        beads = path.parent.parent / ".beads"
-        if (beads / "allocator.json").is_file() or (beads / "events.jsonl").is_file():
-            raise StoreError(f"no store database at {path} (a fresh clone?) — run `cairn sync` "
-                             "to build it from the tracked exports in .beads/")
+        for exports in (path.parent, path.parent.parent / ".beads"):
+            if (exports / "allocator.json").is_file() or (exports / "events.jsonl").is_file():
+                raise StoreError(f"no store database at {path} (a fresh clone?) — run `cairn sync` "
+                                 f"to build it from the tracked exports in {exports.name}/")
         raise StoreError(
             f"no store database at {path} — run `cairn shadow sync` to build it")
     # as_uri() percent-encodes the path; a raw path containing '?', '#' or '%'

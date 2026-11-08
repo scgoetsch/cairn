@@ -204,8 +204,12 @@ and in the table above.
 
 ### What git must carry, and worktrees
 
-The database is git-ignored. What rebuilds it is the two JSONL exports plus two files bd's export
-format has no rows for: `cairn export --allocator -o .beads/allocator.json` writes every id ever
+The database is git-ignored. What rebuilds it is four tracked files, which live in the store
+directory itself (`.cairn/issues.jsonl`, `memories.jsonl`, `allocator.json`, `events.jsonl`; the
+`.cairn/.gitignore` cairn writes un-ignores them) since 0.7.0. Before, they lived in `.beads/`,
+and cairn still reads them there while `.cairn/` holds none, so a clone that has not pulled the
+move keeps working and a pull that moves them moves the clone with it. The two JSONL exports are
+bd's format; two more files hold what that format has no rows for: `cairn export --allocator -o .beads/allocator.json` writes every id ever
 issued and each parent's last child number, in the seed format; `cairn export --events -o
 .beads/events.jsonl` writes the history, one JSON line per event, oldest first, every key present
 (`id`, `kind`, `issue_id`, `memory_key`, `actor`, `created_at`, `data` as an object). `data` is
@@ -233,7 +237,7 @@ is the file's by construction and pinned by the test) and refuses a row with a k
 
 Worktrees on one machine share one database through the redirect. Another clone (another
 machine, CI, a re-clone) has its own, and git carries only the four files. `cairn sync` brings a
-clone's database up to them. It compares the store's event history with `.beads/events.jsonl`:
+clone's database up to them. It compares the store's event history with the tracked `events.jsonl`:
 a later export of one store is a string prefix of the new one, so the two are **equal**, the
 store is **ahead** (writes not exported yet: the export refresh writes them), the store is
 **behind** (a pull brought another clone's work: `sync` rebuilds the database from the four files,
@@ -251,7 +255,8 @@ anything, under the store's write lock, and a write that was waiting for that lo
 instead of landing in the replaced file. What the four files have no field for, a rebuild takes
 from the memory events (since 0.7.0): memory tombstones from `memory_deleted`, so `check` names
 the deletion time of a forgotten key after a `sync`, and each memory's `created_at` (the
-`memory_set` that started its current life) and `updated_at` (its last `memory_set`). A ledger
+`memory_set` that started its current life) and `updated_at` (its last `memory_set` that changed
+the body, as the writer keeps it). A ledger
 given to `init --ledger` only fills keys the events never mention. A rebuild prints its warnings
 after the `Synced` line (`--json`: `warnings`).
 
@@ -469,13 +474,18 @@ deliberate differences below), `cairn check` its hard link check, and the
 links (damping 0.85), times recency (0.5 ** (age / half-life), age from the
 newest YYYY-MM-DD in the key or body or from `updated_at`, whichever is later;
 an undated memory counts 0.3), times 0.1 for a key some memory `supersedes`;
-same defaults (half-life 90 days, recency weight 0.5) and, on this repo's store,
-the same order as bd-memgraph except where `updated_at` is newer than the body's
-dates. `cairn related KEY` is its `related`, and `--depth N` walks the links N
-hops, which is what its `lineage` printed; issue links are listed, not walked.
-Not carried: `graph` (a DOT dump nothing reads) and `stats` (`cairn check` and
-`cairn stats` count the store; the link census was a curation aid nothing
-calls); a memory's versions are `cairn history --memory`.
+same defaults (half-life 90 days, recency weight 0.5). It differs from
+bd-memgraph in what dates a memory: `updated_at` (the last change of the body,
+from the events after a rebuild) where bd-memgraph read its ledger's
+`last_changed`, the day it happened to observe a change; in listing every memory
+unless `-n N` (bd-memgraph: the top 20); and in breaking a tie of score and
+recency by key A to Z (bd-memgraph: Z to A). A keyword keeps the whole graph's
+scores and shows only the matches. `cairn related KEY` is its `related`, and
+`--depth N` walks the links N hops, which is what its `lineage` printed; issue
+links are listed, not walked, and a link to a missing memory is shown. Not
+carried: `graph` (a Mermaid flowchart of the links, nothing reads it) and
+`stats` (a link census for curation; `cairn check` and `cairn stats` count the
+store); a memory's versions are `cairn history --memory`.
 
 A memory's earlier versions are in its events: `memory_set` and
 `memory_deleted` carry the body they replaced as `old_value` (since 0.4.1;

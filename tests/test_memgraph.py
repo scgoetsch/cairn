@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
+from unittest import mock
 
 from cairn import memgraph
 from cairn.store import db_path
@@ -56,6 +58,8 @@ class ReplayTest(SyncCase):
 
     def test_timestamps_come_back_from_the_events(self):
         self.w(self.a, "remember", "--key", "k2", "one")
+        self.w(self.a, "remember", "--key", "k2", "two")
+        time.sleep(1.1)                       # a later second: the same body again is no change
         self.w(self.a, "remember", "--key", "k2", "two")
         self.assertEqual(self.rebuild_b()[0], 0)
         sql = "SELECT key, created_at, updated_at FROM memories ORDER BY key"
@@ -109,6 +113,73 @@ class ReplayTest(SyncCase):
         self.assertEqual(stones["bd-era"]["deleted_at"], "2026-02-02")
 
 
+class HandBuiltReplayTest(WritableCase):
+    """Event shapes the writer no longer makes (0.4.0 hashes only, Dolt imports) and sequences it
+    cannot make, fed to `init --from --events` (gap-closure spec section 4; grok's review)."""
+
+    def event(self, n, kind, key, at, **data):
+        return {"_type": "event", "id": f"ev-{n}", "kind": kind, "issue_id": None,
+                "memory_key": key, "actor": "x", "created_at": at, "data": data}
+
+    def init(self, memories, events, ledger=None):
+        root = self.workspace / f"case-{len(list(self.workspace.glob('case-*')))}"
+        root.mkdir()
+        export = root / "export.jsonl"
+        export.write_text("".join(json.dumps({"_type": "memory", "key": k, "value": v}) + "\n"
+                                  for k, v in memories.items()))
+        ev = root / "events.jsonl"
+        ev.write_text("".join(json.dumps(e) + "\n" for e in events))
+        argv = ["init", "--prefix", "t", "--from", str(export), "--events", str(ev),
+                "--actor", "alice"]
+        if ledger is not None:
+            (root / "ledger.json").write_text(json.dumps(ledger))
+            argv += ["--ledger", str(root / "ledger.json")]
+        code, out, err = self.cli(*argv, cwd=root)
+        self.assertEqual(code, 0, err)
+        return root, out + err
+
+    def test_old_shapes_date_a_live_memory(self):
+        root, _ = self.init({"k": "v3"}, [
+            self.event(1, "memory_set", "k", "2026-08-01T10:00:00.123Z", dolt_commit="c1",
+                       old_hash=None, new_hash="h1", old_value=None),
+            self.event(2, "memory_set", "k", "2026-09-01T10:00:00Z", old_hash="h1", new_hash="h2"),
+            self.event(3, "memory_set", "k", "2026-10-01T10:00:00Z", old_hash="h2", new_hash="h2")])
+        self.assertEqual(rows(root, "SELECT created_at, updated_at FROM memories"),
+                         [{"created_at": "2026-08-01T10:00:00.123Z",
+                           "updated_at": "2026-09-01T10:00:00Z"}])
+
+    def test_imported_memory_updated_then_forgotten_takes_first_seen_from_the_ledger(self):
+        root, _ = self.init({}, [
+            self.event(1, "memory_set", "k", "2026-10-01T00:00:00Z", old_hash="h0", new_hash="h1"),
+            self.event(2, "memory_deleted", "k", "2026-10-02T00:00:00Z", old_hash="h1",
+                       old_value="b")], ledger={"k": {"first_seen": "2026-01-01"}})
+        self.assertEqual(rows(root, "SELECT first_seen, deleted_at FROM memory_tombstones"),
+                         [{"first_seen": "2026-01-01", "deleted_at": "2026-10-02T00:00:00Z"}])
+
+    def test_two_deletes_keep_the_first_life_start(self):
+        root, _ = self.init({}, [
+            self.event(1, "memory_set", "k", "2026-10-01T00:00:00Z", old_hash=None, new_hash="h1"),
+            self.event(2, "memory_deleted", "k", "2026-10-02T00:00:00Z", old_hash="h1"),
+            self.event(3, "memory_deleted", "k", "2026-10-03T00:00:00Z", old_hash="h1")])
+        self.assertEqual(rows(root, "SELECT first_seen, deleted_at FROM memory_tombstones"),
+                         [{"first_seen": "2026-10-01T00:00:00Z", "deleted_at": "2026-10-03T00:00:00Z"}])
+
+    def test_a_live_key_with_a_trailing_delete_keeps_its_times(self):
+        root, said = self.init({"k": "v"}, [
+            self.event(1, "memory_set", "k", "2026-10-01T00:00:00Z", old_hash=None, new_hash="h1"),
+            self.event(2, "memory_set", "k", "2026-10-05T00:00:00Z", old_hash="h1", new_hash="h2"),
+            self.event(3, "memory_deleted", "k", "2026-10-06T00:00:00Z", old_hash="h2")])
+        self.assertIn("is in the export and its later history event is memory_deleted", said)
+        self.assertEqual(rows(root, "SELECT updated_at FROM memories"),
+                         [{"updated_at": "2026-10-05T00:00:00Z"}])
+        self.assertEqual(rows(root, "SELECT key FROM memory_tombstones"), [])
+
+    def test_a_set_for_a_key_not_in_the_export_warns(self):
+        _, said = self.init({}, [
+            self.event(1, "memory_set", "k", "2026-10-01T00:00:00Z", old_hash=None, new_hash="h1")])
+        self.assertIn("memory k has a memory_set event and is not in the export; no tombstone", said)
+
+
 class RankTest(WritableCase):
     def setUp(self) -> None:
         super().setUp()
@@ -139,6 +210,7 @@ class RankTest(WritableCase):
         self.addCleanup(conn.close)
         today = memgraph.datetime.date(2026, 11, 8)
         self.w("remember", "--key", "undated", "no date here")
+        conn.execute("UPDATE memories SET updated_at = '2026-11-08T00:00:00Z'")   # not the clock
         by_key = {r["key"]: r for r in memgraph.rank(conn, today)}
         self.assertEqual(by_key["hub"]["age_days"], 0)        # updated today (the write)
         self.assertEqual(by_key["hub"]["recency"], 1.0)
@@ -147,6 +219,19 @@ class RankTest(WritableCase):
         conn.execute("UPDATE memories SET updated_at = NULL WHERE key = 'undated'")
         self.assertEqual({r["key"]: r for r in memgraph.rank(conn, today)}["undated"]["recency"],
                          memgraph.UNDATED_RECENCY)
+
+    def test_superseded_takes_exactly_a_tenth(self):
+        with_factor = {r["key"]: r["score"] for r in self.ranked()}
+        with mock.patch.object(memgraph, "SUPERSEDED_FACTOR", 1.0):
+            without = {r["key"]: r["score"] for r in self.ranked()}
+        self.assertAlmostEqual(with_factor["old-way"], without["old-way"] * 0.1)
+        self.assertEqual(with_factor["new-way"], without["new-way"])
+
+    def test_ties_go_by_recency_then_key(self):
+        a1, a2, a3 = (next(r for r in self.ranked() if r["key"] == k) for k in ("a1", "a2", "a3"))
+        self.assertEqual(a1["score"], a2["score"])
+        keys = [r["key"] for r in self.ranked() if r["key"] in ("a1", "a2", "a3")]
+        self.assertEqual(keys, ["a1", "a2", "a3"])
 
     def test_keyword_limit_and_text(self):
         self.assertEqual([r["key"] for r in self.ranked("a2")], ["a2"])

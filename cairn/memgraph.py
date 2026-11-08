@@ -68,7 +68,8 @@ def _graph(conn: sqlite3.Connection) -> Tuple[Dict[str, sqlite3.Row], List[sqlit
 
 def rank(conn: sqlite3.Connection, today: datetime.date, *, half_life: float = 90,
          recency_weight: float = 0.5) -> List[Dict[str, Any]]:
-    """Every memory, highest score first (ties by key)."""
+    """Every memory, highest score first; equal scores by recency, then key A to Z (bd-memgraph
+    breaks the last tie Z to A)."""
     store, edges = _graph(conn)
     adj: Dict[str, Set[str]] = {k: set() for k in store}
     for e in edges:
@@ -91,7 +92,7 @@ def rank(conn: sqlite3.Connection, today: datetime.date, *, half_life: float = 9
             score *= SUPERSEDED_FACTOR
         out.append({"key": key, "score": score, "degree": len(adj[key]), "age_days": age,
                     "recency": rec, "superseded": key in superseded})
-    out.sort(key=lambda r: (-r["score"], r["key"]))
+    out.sort(key=lambda r: (-r["score"], -r["recency"], r["key"]))
     return out
 
 

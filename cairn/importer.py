@@ -473,13 +473,21 @@ def replay_memory_events(conn: sqlite3.Connection, ledger: Mapping[str, Any],
             continue
         seen.add(key)
         if row["kind"] == "memory_set":
-            created = json.loads(row["data"]).get("old_hash") is None
+            data = json.loads(row["data"])
+            created = data.get("old_hash") is None
             life_started.setdefault(key, row["created_at"] if created else None)
-            last_set[key] = row["created_at"]
+            # The writer moves updated_at only when the body changes; a rewrite with the same
+            # body (old_hash == new_hash) is an event and not a change, here as there.
+            if created or data.get("old_hash") != data.get("new_hash") or key not in last_set:
+                last_set[key] = row["created_at"]
             deleted.pop(key, None)
         else:
-            deleted[key] = (life_started.pop(key, None), row["created_at"])
-            last_set.pop(key, None)
+            earlier = deleted.get(key)              # a second delete with no set between keeps
+            start = life_started.pop(key, None)     # the first one's life start
+            deleted[key] = (start if start is not None else (earlier[0] if earlier else None),
+                            row["created_at"])
+            # last_set is kept: a key that is in the export although its last event is a
+            # delete (warned below) keeps the times of the sets before it.
     stones: List[Tuple[str, Optional[str], str]] = []
     warnings: List[str] = []
     for key, (first_seen, deleted_at) in sorted(deleted.items()):

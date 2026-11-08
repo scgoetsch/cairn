@@ -381,3 +381,35 @@ class QuickStateTest(SyncCase):
         self.addCleanup(conn.close)
         self.assertEqual(syncmod.quick_state(conn, fresh / ".cairn"), syncmod.NO_FILE)
         self.assertFalse((fresh / ".cairn" / syncmod.STAMP_FILENAME).exists())
+
+
+class ExportsInTheStoreDirectoryTest(SyncCase):
+    """Since 0.7.0 the four files may live in the store directory (.cairn/); .beads/ is read
+    only when .cairn/ holds none of them, so a clone that has not pulled the move keeps working."""
+
+    def move_to_store_dir(self, clone: Path) -> None:
+        for name in FILES:
+            shutil.move(str(clone / ".beads" / name), str(clone / ".cairn" / name))
+
+    def test_a_fresh_clone_builds_from_the_store_directory(self):
+        issue = self.started()
+        self.move_to_store_dir(self.b)
+        self.ok(self.b, "sync")
+        self.assertIn(issue, self.ok(self.b, "show", issue))
+        self.assertEqual(syncmod.exports_dir(self.b / ".cairn"), self.b / ".cairn")
+
+    def test_the_store_directory_wins_over_beads(self):
+        issue = self.started()
+        self.ok(self.b, "sync")
+        self.w(self.a, "close", issue)
+        self.refresh(self.a)
+        for name in FILES:                     # the new state in .cairn/, a stale copy in .beads/
+            shutil.copyfile(self.a / ".beads" / name, self.b / ".cairn" / name)
+        code, out, _ = self.cli("sync", "--status", cwd=self.b)
+        self.assertEqual((code, out.split(":")[0]), (1, "behind"))
+        self.ok(self.b, "sync")
+        self.assertIn("closed", self.ok(self.b, "show", issue, "--json"))
+
+    def test_beads_is_read_while_the_store_directory_has_none(self):
+        self.started()
+        self.assertEqual(syncmod.exports_dir(self.b / ".cairn"), self.b / ".beads")

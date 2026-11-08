@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from cairn import cli, shadow
+from cairn.store import GITIGNORE
 
 from .helpers import StoreCase, child, dep, issue, memory, with_deps, write_jsonl
 
@@ -170,8 +171,8 @@ class AgreementTest(ShadowCase):
         self.assertFalse(self.store_dir.exists())
         self.shadow_cli("run", "--quiet")
         self.assertTrue((self.store_dir / "cairn.db").is_file())
-        self.assertEqual((self.store_dir / ".gitignore").read_text(),
-                         "*\n!.gitignore\n!config.json\n")
+        self.assertEqual((self.store_dir / ".gitignore").read_text(), GITIGNORE)
+        self.assertTrue(GITIGNORE.startswith("*\n!.gitignore\n!config.json\n"))
         leftovers = [p.name for p in self.store_dir.iterdir() if ".tmp-" in p.name]
         self.assertEqual(leftovers, [])
 
