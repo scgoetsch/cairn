@@ -165,10 +165,22 @@ server-mode (`.beads/dolt/`) stores, and derives the child counters from the id
 history if a bd has no `child_counters` table (it says so). `init` records the
 version; `--bd-version` names it when there is no seed.
 
-| bd | Migration | Export layout | Measured |
-|---|---|---|---|
-| 1.1.2 | proven on a 244-issue store | byte-identical | 2026-10-15 |
-| 1.3.1 | proven on the same data plus a deleted child | byte-identical | 2026-10-15 |
+| bd | Migration | Export layout | Measured | History (`history-from-dolt`) |
+|---|---|---|---|---|
+| 1.1.2 | proven on a 244-issue store | byte-identical | 2026-10-15 | every kind read; actors from bd's events table, else the commit message (2026-11-08) |
+| 1.3.1 | proven on the same data plus a deleted child | byte-identical | 2026-10-15 | every kind read; actors from commit messages only (2026-11-08) |
+| 1.3.4 | real-bd tests pass with the 1.3.1 rules | not measured | 2026-11-08 | every kind read; actors from commit messages only |
+
+The history column is `dev/measure-bd-version.sh BD`: a small store grown through that bd
+(issues, a child, description, notes twice, priority, status, a label, a dependency, a comment, a
+close, a deleted issue, a memory set twice, a memory forgotten), read back, every expectation
+checked and `dev/verify-dolt-history.py` run. Memories are `config` rows `kv.memory.<key>` in all
+three. bd 1.3 lists its `events` table (and `bd_events_journal`, `wisps`, ...) in `dolt_ignore`,
+so those rows are in no commit and no event's actor can come from them; the reader takes the
+actor from bd's auto-commit message (`... (auto-commit) by <actor>`) where the events table names
+none, and the manifest says how many (`read.actors_from_commit_messages`) and warns when the events
+table is not versioned. A commit whose message names no actor (1.3's `close`, `delete`) leaves its
+events without one: 5 of 22 events had an actor on 1.3.x, 19 of 22 on 1.1.2.
 
 After the migration cairn's verbs follow bd 1.1.2's rules. bd 1.3.1 tightened
 some of them: closing a parent with an open child, closing an issue assigned to

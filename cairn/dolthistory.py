@@ -145,6 +145,11 @@ def _event_id(*parts: Any) -> str:
     return "dolt-" + hashlib.sha256("\x1f".join(map(str, parts)).encode()).hexdigest()[:24]
 
 
+# bd's auto-commit message names the actor that wrote it ("bd: note (auto-commit) by alice
+# [proj-1]"), measured on bd 1.1.2, 1.3.1 and 1.3.4. Used where bd's events table names none.
+AUTO_COMMIT_ACTOR = re.compile(r"\(auto-commit\) by (\S+)")
+
+
 class Reader:
     def __init__(self, query: Query) -> None:
         self.q = query
@@ -154,7 +159,8 @@ class Reader:
     # -- the commit timeline ----------------------------------------------------------------
 
     def commits(self) -> Dict[str, Tuple[int, str]]:
-        rows = self.q("SELECT commit_hash, committer, date FROM dolt_log")
+        rows = self.q("SELECT commit_hash, committer, date, message FROM dolt_log")
+        self.messages = {r["commit_hash"]: r.get("message") or "" for r in rows}
         merges = self.q("SELECT commit_hash FROM dolt_commit_ancestors "
                         "GROUP BY commit_hash HAVING COUNT(*) > 1")
         if merges:
@@ -222,8 +228,23 @@ def read_history(query: Query, *, export: Optional[Sequence[Dict[str, Any]]] = N
     commits = r.commits()
     r.bd_events = []
     actors = r.actors() if "events" in tables else {}
-    if "events" not in tables:
-        r.manifest["warnings"].append("no events table: no event has an actor")
+    if "events" in tables:
+        unversioned = r.q("SELECT COUNT(*) AS n FROM dolt_diff_events WHERE to_commit = 'WORKING'")
+        if unversioned and unversioned[0]["n"] and not r.bd_events:
+            r.manifest["warnings"].append(
+                f"bd's events table is not versioned in this store (dolt_ignore; bd 1.3 does this): "
+                f"its {unversioned[0]['n']} row(s) are in no commit, so no actor comes from it")
+    else:
+        r.manifest["warnings"].append("no events table: actors come from commit messages only")
+    from_messages = 0
+    for commit, message in r.messages.items():
+        if commit in actors:
+            continue
+        said = AUTO_COMMIT_ACTOR.search(message)
+        if said:
+            actors[commit] = said.group(1)
+            from_messages += 1
+    r.manifest["read"]["actors_from_commit_messages"] = from_messages
     out: List[Dict[str, Any]] = []
     per_commit: Counter = Counter()
 

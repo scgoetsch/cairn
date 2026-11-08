@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from cairn import dolthistory
 from cairn.eventdata import apply_field_change
@@ -59,6 +59,8 @@ class ReaderTest(unittest.TestCase):
         self.repo.mkdir(parents=True)
         self.dolt("init")
         self.n = 0
+        self.messages: Dict[int, str] = {}       # step -> commit message (default "step N")
+        self.no_actor: Set[int] = set()          # steps whose events row is left out
         self.commit(SCHEMA, actor=None)
 
     def dolt(self, *argv: str) -> str:
@@ -70,12 +72,15 @@ class ReaderTest(unittest.TestCase):
     def commit(self, sql: str, *, actor: Any = "alice", kind: str = "updated",
                issue: str = "t-1") -> None:
         self.n += 1
+        if self.n in self.no_actor:
+            actor = None
         if actor:
             sql += (f"; INSERT INTO events VALUES ('e{self.n}', '{issue}', '{kind}', '{actor}', "  # noqa: S608 — test-literal values in a throwaway Dolt repo
                     f"NULL, NULL, NULL, '2026-05-0{min(self.n, 9)} 10:00:00')")
         self.dolt("sql", "-q", sql)
         self.dolt("add", "-A")
-        self.dolt("commit", "-m", f"step {self.n}", "--date", f"2026-05-01T10:{self.n:02d}:00")
+        self.dolt("commit", "-m", self.messages.get(self.n, f"step {self.n}"),
+                  "--date", f"2026-05-01T10:{self.n:02d}:00")
 
     def read(self, **kw: Any) -> Any:
         with dolthistory.dolt_copy(self.tmp / ".beads", DOLT) as (_, query):
@@ -159,6 +164,21 @@ class ReaderTest(unittest.TestCase):
         self.assertEqual(manifest["config_changes_not_memories"], 1)
         self.assertIn("content_hash", manifest["issue_columns_not_carried"])
         self.assertEqual(manifest["carried"]["memory_deleted"], 1)
+
+    def test_an_actor_missing_from_the_events_table_comes_from_the_commit_message(self):
+        # bd 1.3 keeps its events table out of every commit (dolt_ignore); its auto-commit
+        # messages still name the actor (measured on 1.1.2, 1.3.1, 1.3.4).
+        self.messages = {3: "bd: update (auto-commit) by dave [t-1]",
+                         4: "bd: note (auto-commit) by zed [t-1]"}
+        self.no_actor = {3}
+        self.build()
+        events, manifest = self.read(export=self.EXPORT)
+        by_step = {}
+        for e in events:
+            by_step.setdefault(e["created_at"][:16], set()).add(e["actor"])
+        self.assertEqual(by_step["2026-05-01T10:03"], {"dave"})     # from the message
+        self.assertEqual(by_step["2026-05-01T10:04"], {"alice"})    # the events table wins
+        self.assertEqual(manifest["read"]["actors_from_commit_messages"], 1)
 
     def test_two_runs_give_the_same_events(self):
         self.build()

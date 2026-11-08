@@ -29,6 +29,10 @@ STRICT_CLOSE = STRICT_TAKEOVER = CREATE_ID_REFUSED = TARGET_DEP_ORDER = VERSION 
 # Read-side differences seen on 1.3.1 and not analysed: `show` adds a `revision`
 # field; `ready` orders issues differently. The shadow comparison reports them;
 # they do not touch the export, so a migration is unaffected.
+# Measured 2026-11-08 with dev/measure-bd-version.sh on 1.1.2, 1.3.1 and 1.3.4: the Dolt history
+# reads the same on all three (memories in config kv.memory.*), but 1.3 keeps its events table in
+# dolt_ignore, so actors come only from auto-commit messages (README, the version table).
+EVENTS_TABLE_UNVERSIONED = VERSION >= (1, 3)
 KNOWN_READ_DIFFERENCES = (
     (r"^show \S+: bd and cairn differ in \['revision'\]$", r"^ready order: ")
     if VERSION >= (1, 3) else ())

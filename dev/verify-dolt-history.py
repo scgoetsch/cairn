@@ -53,11 +53,20 @@ def main() -> int:
     want_text = {(r["id"], c, r[c]) for r in issue_rows for c in TEXT if r.get(c) not in (None, "")}
     current = {(r["id"], c): r[c] for r in export if r.get("_type", "issue") == "issue"
                for c in TEXT if r.get(c) not in (None, "")}
+    # A deleted issue is not in the export: its last state is the payload of its `deleted` event.
+    exported_ids = {r["id"] for r in export if r.get("_type", "issue") == "issue"}
+    for e in events:
+        if e["kind"] == "deleted" and e["issue_id"] not in exported_ids:
+            issue = e["data"].get("issue") or {}
+            for c in TEXT:
+                if issue.get(c) not in (None, ""):
+                    current[(e["issue_id"], c)] = issue[c]
     changes = defaultdict(list)
     for e in events:
         if e["kind"] == "field_change" and e["data"].get("field") in TEXT:
             changes[(e["issue_id"], e["data"]["field"])].append(e["data"])
-    have_text = set()
+    have_text = {(e["issue_id"], "title", e["data"]["title"]) for e in events
+                 if e["kind"] == "created" and e["data"].get("title")}
     for key in set(changes) | set(current):
         text = current.get(key)
         if text is not None:
