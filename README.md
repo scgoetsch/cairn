@@ -97,6 +97,28 @@ cairn init -p proj --from bd.jsonl --seed seed.json --events history.jsonl \
 cairn migrate                     # later: bring a writable store to a newer schema
 ```
 
+The order, for a repo whose store is bd (beads-agent-pipeline 0.2.0 and later install on cairn
+only and refuse a live bd store that has not been through this). Stop at the first failure:
+
+1. Freeze every writer: no other session, no `bd dolt push`, no other clone writing.
+2. `bd export --all -o bd.jsonl`.
+3. `cairn seed-from-dolt .beads --dolt PATH/TO/dolt -o seed.json`. A seed not read from Dolt (a
+   hand-made one) lacks the ids bd deleted, and cairn could issue them again.
+4. `cairn history-from-dolt ... --export bd.jsonl -o history.jsonl --manifest manifest.json`
+   (`--interactions .beads/interactions.jsonl` when the file exists). If it fails, stop: an
+   `init` without `--events` is a content migration that silently leaves the history behind.
+5. `cairn init -p PREFIX --from bd.jsonl --seed seed.json --events history.jsonl` (plus `--ledger`
+   and `--hot` when those files exist). It must print that the re-export is byte-identical, or
+   equal in content with a layout warning; anything else is a failed migration.
+6. `cairn check`, then write the four tracked files into `.cairn/` (`cairn export --all`, split
+   into `issues.jsonl` and `memories.jsonl`; `cairn export --allocator -o .cairn/allocator.json`;
+   `cairn export --events -o .cairn/events.jsonl`; the pipeline's `tools/refresh-beads-exports.sh`
+   does all of it) and commit them with `.cairn/config.json` and `.cairn/.gitignore`.
+7. Only now replace bd's hooks (git hooks, harness hooks) with ones that call cairn; the
+   pipeline's installer does this.
+8. Keep `.beads/` until a person has read the manifest; archive it, then remove it. Every other
+   clone needs cairn 0.7.0 or later and a `cairn sync` after it pulls.
+
 `init --from` builds a writable store from a bd export, all or nothing. It
 refuses an export it cannot represent faithfully (a row type it does not know,
 an issue under another prefix) and never replaces an existing store. The id
@@ -119,7 +141,10 @@ tables, so only changes leave Dolt, and writes an events file for `init
 `old_value`) and deletions, labels, dependencies and comments. Each event is
 dated by its Dolt commit, carries `data.dolt_commit`, has the id
 `dolt-<hash>` (two runs give the same file), and takes its actor from the row
-bd wrote to its `events` table in that commit. `--interactions` merges bd's
+bd wrote to its `events` table in that commit, else (since 0.7.0) from bd's
+auto-commit message (`... (auto-commit) by <actor>`): bd 1.3 keeps that table out
+of every commit. A commit whose events table names two actors, or whose message
+names more than one, gets none. `--interactions` merges bd's
 field-change log in by time and keeps a change both sources hold once, from
 the log (same issue, field and values, within 5 seconds; a notes append in Dolt
 matches the log's full-shape row of it). `--export` (required) is the export
@@ -305,7 +330,7 @@ always run from the directory that holds `.beads/`.
 | `CAIRN_DEBUG` | print a traceback for an internal error |
 
 Git ignores everything in `.cairn/` except `config.json`, the one file there
-that is not derived:
+that is not derived, and the four tracked files when they live there (since 0.7.0):
 
 ```json
 {"issue_prefixes": ["ws"]}

@@ -1,7 +1,8 @@
 """More than one clone: the tracked exports are the channel, the database a local copy.
 
-A writable store's database is git-ignored. What git carries between clones is the four files
-under `.beads/` beside the store (issues.jsonl, memories.jsonl, allocator.json, events.jsonl).
+A writable store's database is git-ignored. What git carries between clones is four files
+(issues.jsonl, memories.jsonl, allocator.json, events.jsonl): in the store directory itself since
+0.7.0, under `.beads/` beside it before (exports_dir reads either, never both).
 The database is a copy of those files plus the writes not yet exported. Which of the two is
 ahead is read from the event history: `export --events` is one line per event in recording
 order, so a later export of one store is a string prefix of the new one (EventsExportTest).

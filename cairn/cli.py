@@ -112,7 +112,8 @@ def connect(start: Path) -> sqlite3.Connection:
 
 def ensure_store_dir(path: Path) -> None:
     """Create the store directory. Git ignores everything in it except its
-    config.json: the database and the log are derived and rebuilt on each sync."""
+    config.json and the four tracked files: the database and the log are derived and rebuilt
+    on each sync."""
     path.mkdir(parents=True, exist_ok=True)
     ignore = path / ".gitignore"
     if not ignore.exists():
