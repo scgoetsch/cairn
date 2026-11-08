@@ -478,7 +478,7 @@ def replay_memory_events(conn: sqlite3.Connection, ledger: Mapping[str, Any],
             life_started.setdefault(key, row["created_at"] if created else None)
             # The writer moves updated_at only when the body changes; a rewrite with the same
             # body (old_hash == new_hash) is an event and not a change, here as there.
-            if created or data.get("old_hash") != data.get("new_hash") or key not in last_set:
+            if created or data.get("old_hash") != data.get("new_hash"):
                 last_set[key] = row["created_at"]
             deleted.pop(key, None)
         else:
@@ -504,8 +504,12 @@ def replay_memory_events(conn: sqlite3.Connection, ledger: Mapping[str, Any],
     for key in sorted(seen - deleted.keys() - live_keys):
         warnings.append(f"memory {key} has a memory_set event and is not in the export; "
                         "no tombstone (the export has no deletion time)")
-    stamps: MemoryStamps = {key: (life_started.get(key), last_set.get(key))
-                            for key in live_keys & set(last_set)}
+    # A live key whose last event is a delete (warned above) keeps that life's start too.
+    started = {key: life_started.get(key) or (deleted[key][0] if key in deleted else None)
+               for key in live_keys}
+    stamps: MemoryStamps = {key: (started[key], last_set.get(key))
+                            for key in live_keys & (set(last_set) | set(started))
+                            if started[key] or last_set.get(key)}
     return stones, stamps, warnings
 
 

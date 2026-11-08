@@ -147,7 +147,7 @@ def _event_id(*parts: Any) -> str:
 
 # bd's auto-commit message names the actor that wrote it ("bd: note (auto-commit) by alice
 # [proj-1]"), measured on bd 1.1.2, 1.3.1 and 1.3.4. Used where bd's events table names none.
-AUTO_COMMIT_ACTOR = re.compile(r"\(auto-commit\) by (\S+)")
+AUTO_COMMIT_ACTOR = re.compile(r"\(auto-commit\) by (\S+)(?= \[|$)")
 
 
 class Reader:
@@ -193,6 +193,7 @@ class Reader:
         if many:
             self.manifest["warnings"].append(f"{many} commit(s) carry more than one actor; "
                                              "their events have none")
+        self.ambiguous = {c for c, a in seen.items() if len(a) > 1}
         return {c: next(iter(a)) for c, a in seen.items() if len(a) == 1}
 
     # -- per table -------------------------------------------------------------------------
@@ -237,12 +238,13 @@ def read_history(query: Query, *, export: Optional[Sequence[Dict[str, Any]]] = N
     else:
         r.manifest["warnings"].append("no events table: actors come from commit messages only")
     from_messages = 0
+    ambiguous = getattr(r, "ambiguous", set())
     for commit, message in r.messages.items():
-        if commit in actors:
+        if commit in actors or commit in ambiguous:      # two actors in the events table: none
             continue
-        said = AUTO_COMMIT_ACTOR.search(message)
-        if said:
-            actors[commit] = said.group(1)
+        said = AUTO_COMMIT_ACTOR.findall(message)
+        if len(said) == 1 and message.count("(auto-commit) by") == 1:   # one clear name, or none
+            actors[commit] = said[0]
             from_messages += 1
     r.manifest["read"]["actors_from_commit_messages"] = from_messages
     out: List[Dict[str, Any]] = []

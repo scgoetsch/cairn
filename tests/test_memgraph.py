@@ -170,9 +170,24 @@ class HandBuiltReplayTest(WritableCase):
             self.event(2, "memory_set", "k", "2026-10-05T00:00:00Z", old_hash="h1", new_hash="h2"),
             self.event(3, "memory_deleted", "k", "2026-10-06T00:00:00Z", old_hash="h2")])
         self.assertIn("is in the export and its later history event is memory_deleted", said)
-        self.assertEqual(rows(root, "SELECT updated_at FROM memories"),
-                         [{"updated_at": "2026-10-05T00:00:00Z"}])
+        self.assertEqual(rows(root, "SELECT created_at, updated_at FROM memories"),
+                         [{"created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-05T00:00:00Z"}])
         self.assertEqual(rows(root, "SELECT key FROM memory_tombstones"), [])
+
+    def test_a_same_body_first_event_leaves_the_ledger_date(self):
+        root, _ = self.init({"k": "same"}, [
+            self.event(1, "memory_set", "k", "2026-10-01T00:00:00Z", old_hash="h", new_hash="h")],
+            ledger={"k": {"first_seen": "2026-01-01", "last_changed": "2026-06-01"}})
+        self.assertEqual(rows(root, "SELECT created_at, updated_at FROM memories"),
+                         [{"created_at": "2026-01-01", "updated_at": "2026-06-01"}])
+
+    def test_a_body_change_event_wins_over_a_later_ledger_date(self):
+        # The ledger's last_changed is the day bd-memgraph looked, not the day the body changed.
+        root, _ = self.init({"k": "v2"}, [
+            self.event(1, "memory_set", "k", "2026-09-07T15:36:22Z", old_hash="h1", new_hash="h2")],
+            ledger={"k": {"first_seen": "2026-01-01", "last_changed": "2026-09-30"}})
+        self.assertEqual(rows(root, "SELECT updated_at FROM memories"),
+                         [{"updated_at": "2026-09-07T15:36:22Z"}])
 
     def test_a_set_for_a_key_not_in_the_export_warns(self):
         _, said = self.init({}, [
@@ -228,10 +243,24 @@ class RankTest(WritableCase):
         self.assertEqual(with_factor["new-way"], without["new-way"])
 
     def test_ties_go_by_recency_then_key(self):
-        a1, a2, a3 = (next(r for r in self.ranked() if r["key"] == k) for k in ("a1", "a2", "a3"))
-        self.assertEqual(a1["score"], a2["score"])
-        keys = [r["key"] for r in self.ranked() if r["key"] in ("a1", "a2", "a3")]
-        self.assertEqual(keys, ["a1", "a2", "a3"])
+        days = (("z-new", "2026-11-01"), ("m-old", "2026-01-01"), ("a-old", "2026-01-01"))
+        for key, _ in days:
+            self.w("remember", "--key", key, f"an orphan {key}")
+        conn = sqlite3.connect(db_path(self.store_dir))
+        self.addCleanup(conn.close)
+        for key, day in days:
+            conn.execute("UPDATE memories SET updated_at = ? WHERE key = ?", (day + "T00:00:00Z", key))
+        conn.commit()
+        conn.row_factory = sqlite3.Row
+        today = memgraph.datetime.date(2026, 11, 8)
+        # Recency weight 0: every orphan scores the same; recency then key break the tie.
+        ranked = [r["key"] for r in memgraph.rank(conn, today, recency_weight=0)
+                  if r["key"] in ("z-new", "m-old", "a-old")]
+        self.assertEqual(ranked, ["z-new", "a-old", "m-old"])
+
+    def test_a_keyword_does_not_change_the_scores(self):
+        whole = {r["key"]: r["score"] for r in self.ranked()}
+        self.assertEqual([(r["key"], r["score"]) for r in self.ranked("a2")], [("a2", whole["a2"])])
 
     def test_keyword_limit_and_text(self):
         self.assertEqual([r["key"] for r in self.ranked("a2")], ["a2"])

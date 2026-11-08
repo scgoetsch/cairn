@@ -9,6 +9,8 @@ notes, close reason) that Dolt ever held can be recovered from HISTORY plus EXPO
 as a replaced `old_value` or as the live body, an issue text by walking the issue's field changes
 back from the exported value (an `appended` tail peels off the end). Prints the counts; exit 1
 with the first missing values otherwise. Reads a COPY of the Dolt store, as the verb does.
+A deleted issue's chain starts at its `deleted` payload. Not handled: an id deleted, issued again
+and deleted again (bd never reissues an id): its two lives are walked as one.
 """
 
 from __future__ import annotations

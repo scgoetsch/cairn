@@ -398,17 +398,25 @@ class ExportsInTheStoreDirectoryTest(SyncCase):
         self.assertIn(issue, self.ok(self.b, "show", issue))
         self.assertEqual(syncmod.exports_dir(self.b / ".cairn"), self.b / ".cairn")
 
-    def test_the_store_directory_wins_over_beads(self):
-        issue = self.started()
+    def test_a_split_between_the_two_directories_is_refused(self):
+        self.started()
         self.ok(self.b, "sync")
-        self.w(self.a, "close", issue)
-        self.refresh(self.a)
-        for name in FILES:                     # the new state in .cairn/, a stale copy in .beads/
-            shutil.copyfile(self.a / ".beads" / name, self.b / ".cairn" / name)
-        code, out, _ = self.cli("sync", "--status", cwd=self.b)
-        self.assertEqual((code, out.split(":")[0]), (1, "behind"))
-        self.ok(self.b, "sync")
-        self.assertIn("closed", self.ok(self.b, "show", issue, "--json"))
+        shutil.move(str(self.b / ".beads" / "issues.jsonl"), str(self.b / ".cairn" / "issues.jsonl"))
+        for argv in (("sync",), ("ready",), ("create", "--title", "x", "--actor", "bob")):
+            code, _, err = self.cli(*argv, cwd=self.b)
+            self.assertEqual(code, 2, argv)
+            self.assertIn("the tracked exports are split: issues.jsonl in .cairn/", err)
+
+    def test_an_unmerged_file_in_the_store_directory_is_seen(self):
+        self.started()
+        self.move_to_store_dir(self.b)
+        subprocess.run(["git", "init", "-q"], cwd=self.b, check=True)
+        blob = subprocess.run(["git", "hash-object", "-w", ".cairn/allocator.json"], cwd=self.b,
+                              check=True, capture_output=True, text=True).stdout.strip()
+        index = "".join(f"100644 {blob} {stage}\t.cairn/allocator.json\n" for stage in (1, 2, 3))
+        subprocess.run(["git", "update-index", "--index-info"], cwd=self.b, input=index,
+                       check=True, text=True)
+        self.assertEqual(syncmod.unmerged(self.b / ".cairn"), [".cairn/allocator.json"])
 
     def test_beads_is_read_while_the_store_directory_has_none(self):
         self.started()

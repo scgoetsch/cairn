@@ -47,9 +47,18 @@ def exports_dir(store_dir: Path) -> Path:
     when it holds any of the four files, else `<checkout>/.beads/`, where they were before. So a
     pull that moves them moves every clone with it, and a clone that has not pulled the move yet
     keeps reading the old place: no flag day."""
-    if any((store_dir / name).is_file() for name in EXPORT_FILES):
+    here = [name for name in EXPORT_FILES if (store_dir / name).is_file()]
+    old = store_dir.parent / EXPORTS_DIRNAME
+    if here:
+        there = [name for name in EXPORT_FILES if (old / name).is_file()]
+        if there:
+            # Half moved: whichever directory is read, the other's files are ignored and the
+            # store would be compared with a history it is not reading. Refuse, by name.
+            raise StoreError(f"the tracked exports are split: {', '.join(here)} in "
+                             f"{store_dir.name}/ and {', '.join(there)} in {EXPORTS_DIRNAME}/. "
+                             f"Move all four into {store_dir.name}/ (git mv), then run again")
         return store_dir
-    return store_dir.parent / EXPORTS_DIRNAME
+    return old
 
 
 def file_lines(path: Path) -> List[str]:
@@ -312,7 +321,8 @@ def unmerged(store_dir: Path) -> List[str]:
     """Export files git still has in conflict: never rebuilt from."""
     checkout = store_dir.parent
     try:
-        out = subprocess.run(["git", "-C", str(checkout), "ls-files", "-u", "--", EXPORTS_DIRNAME],
+        out = subprocess.run(["git", "-C", str(checkout), "ls-files", "-u", "--", store_dir.name,
+                              EXPORTS_DIRNAME],
                              capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return []

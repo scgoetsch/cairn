@@ -209,9 +209,9 @@ directory itself (`.cairn/issues.jsonl`, `memories.jsonl`, `allocator.json`, `ev
 `.cairn/.gitignore` cairn writes un-ignores them) since 0.7.0. Before, they lived in `.beads/`,
 and cairn still reads them there while `.cairn/` holds none, so a clone that has not pulled the
 move keeps working and a pull that moves them moves the clone with it. The two JSONL exports are
-bd's format; two more files hold what that format has no rows for: `cairn export --allocator -o .beads/allocator.json` writes every id ever
+bd's format; two more files hold what that format has no rows for: `cairn export --allocator -o .cairn/allocator.json` writes every id ever
 issued and each parent's last child number, in the seed format; `cairn export --events -o
-.beads/events.jsonl` writes the history, one JSON line per event, oldest first, every key present
+.cairn/events.jsonl` writes the history, one JSON line per event, oldest first, every key present
 (`id`, `kind`, `issue_id`, `memory_key`, `actor`, `created_at`, `data` as an object). `data` is
 opaque to import and export: `memory_set` and `memory_deleted` rows written under 0.4.0 have no
 `old_value` (see Memory links), and a file that mixes both shapes imports and re-exports byte for
@@ -227,8 +227,8 @@ the middle of a run of appends has only the tails. Any other notes change (a rep
 keeps the full shape. Rows written before 0.4.2 are all the full shape and import as they are. Two
 exports of
 one store are equal and a new event lands at the end, so git sees an append. A fresh checkout
-rebuilds with `cairn init -p P --from <issues + memories> --seed .beads/allocator.json --events
-.beads/events.jsonl` without reissuing an id and with its history (`FreshCheckoutTest`,
+rebuilds with `cairn init -p P --from <issues + memories> --seed .cairn/allocator.json --events
+.cairn/events.jsonl` without reissuing an id and with its history (`FreshCheckoutTest`,
 `EventsExportTest`); `init` checks that every event came back with its content (per id; the order
 is the file's by construction and pinned by the test) and refuses a row with a key it does not know. A git worktree checks out `.cairn/config.json` but no database; an untracked
 `.cairn/redirect` holding the absolute path of the main `.cairn/` points every verb there (one hop).

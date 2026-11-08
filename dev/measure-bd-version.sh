@@ -65,7 +65,7 @@ out = {"bd": version, "history_from_dolt_exit": int(hist_rc),
        "verify_exit": int(verify_rc), "verify": verify.strip().splitlines()}
 stores = [d for d in ("embeddeddolt", "dolt") if os.path.isdir(os.path.join(repo, d))]
 out["dolt_dirs"] = stores
-# Where the memories live in this version: ask Dolt directly, on a copy of the repo.
+# Where the memories live in this version: ask Dolt directly (the scratch repo is ours).
 for d in stores:
     for root, dirs, _ in os.walk(os.path.join(repo, d)):
         if ".dolt" in dirs:
@@ -88,24 +88,38 @@ out["events"] = dict(sorted(kinds.items()))
 def has(pred):
     return any(pred(e) for e in events)
 field = lambda e, f: e["kind"] == "field_change" and e["issue_id"] == a and e["data"].get("field") == f
+created = {e["issue_id"]: e["data"].get("title") for e in events if e["kind"] == "created"}
+manifest = json.load(open(os.path.join(w, "man.json"))) if os.path.isfile(os.path.join(w, "man.json")) else {}
+actors = [e["actor"] for e in events if e["actor"]]
+out["actors"] = {"with": len(actors), "of": len(events),
+                 "from_commit_messages": manifest.get("read", {}).get("actors_from_commit_messages")}
+notes = [e["data"] for e in events if field(e, "notes")]
 checks = {
-    "three issues created": kinds.get("created", 0) == 3,
-    "description change": has(lambda e: field(e, "description")),
-    "notes: full first, then the appended tail": has(lambda e: field(e, "notes") and "new_value" in e["data"])
-        and has(lambda e: field(e, "notes") and e["data"].get("appended") == "\nnote two"),
+    "three issues created, by title": created == {a: "alpha", b: "beta", c: "gamma"},
+    "description set": has(lambda e: field(e, "description") and e["data"].get("new_value") == "first description"),
+    "notes: first the full text, then only the appended tail": len(notes) == 2
+        and notes[0].get("new_value") == "note one" and notes[1].get("appended") == "\nnote two",
     "priority change 2 -> 1": has(lambda e: field(e, "priority") and e["data"].get("old_value") == 2
                                   and e["data"].get("new_value") == 1),
-    "status change": has(lambda e: field(e, "status")),
-    "label added": has(lambda e: e["kind"] == "label_added" and e["issue_id"] == a),
-    "dependency added": has(lambda e: e["kind"] == "dependency_added" and e["issue_id"] == b),
+    "status open -> in_progress": has(lambda e: field(e, "status") and e["data"].get("old_value") == "open"
+                                      and e["data"].get("new_value") == "in_progress"),
+    "label urgent added": has(lambda e: e["kind"] == "label_added" and e["issue_id"] == a
+                              and e["data"].get("label") == "urgent"),
+    "dependency beta -> alpha": has(lambda e: e["kind"] == "dependency_added" and e["issue_id"] == b
+                                    and e["data"].get("depends_on_id") == a),
     "comment added": has(lambda e: e["kind"] == "comment_added" and e["issue_id"] == a),
-    "close of beta": has(lambda e: e["issue_id"] == b and e["kind"] == "field_change"
-                         and e["data"].get("field") == "status" and e["data"].get("new_value") == "closed"),
-    "deleted child": has(lambda e: e["kind"] == "deleted" and e["issue_id"] == c),
+    "close of beta, with its reason": has(lambda e: e["issue_id"] == b and e["kind"] == "field_change"
+                         and e["data"].get("field") == "status" and e["data"].get("new_value") == "closed")
+        and has(lambda e: e["issue_id"] == b and e["kind"] == "field_change"
+                and e["data"].get("field") == "close_reason" and e["data"].get("new_value") == "done"),
+    "deleted child, with its last state": has(lambda e: e["kind"] == "deleted" and e["issue_id"] == c
+                                              and (e["data"].get("issue") or {}).get("title") == "gamma"),
     "memory set twice, old body kept": has(lambda e: e["kind"] == "memory_set" and e["memory_key"] == "mem-kept"
                                            and e["data"].get("old_value") == "body one"),
     "forgotten memory, last body kept": has(lambda e: e["kind"] == "memory_deleted" and e["memory_key"] == "mem-gone"
                                             and e["data"].get("old_value") == "short lived"),
+    "every actor named is the one that wrote (measure)": set(actors) <= {"measure"},
+    "some event has its actor": len(actors) > 0,
     "verifier passes": int(verify_rc) == 0,
 }
 out["checks"] = {k: ("ok" if v else "FAILED") for k, v in checks.items()}

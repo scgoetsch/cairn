@@ -61,6 +61,7 @@ class ReaderTest(unittest.TestCase):
         self.n = 0
         self.messages: Dict[int, str] = {}       # step -> commit message (default "step N")
         self.no_actor: Set[int] = set()          # steps whose events row is left out
+        self.extra: Dict[int, str] = {}          # step -> more SQL in that commit
         self.commit(SCHEMA, actor=None)
 
     def dolt(self, *argv: str) -> str:
@@ -74,6 +75,8 @@ class ReaderTest(unittest.TestCase):
         self.n += 1
         if self.n in self.no_actor:
             actor = None
+        if self.n in self.extra:
+            sql += "; " + self.extra[self.n]
         if actor:
             sql += (f"; INSERT INTO events VALUES ('e{self.n}', '{issue}', '{kind}', '{actor}', "  # noqa: S608 — test-literal values in a throwaway Dolt repo
                     f"NULL, NULL, NULL, '2026-05-0{min(self.n, 9)} 10:00:00')")
@@ -179,6 +182,23 @@ class ReaderTest(unittest.TestCase):
         self.assertEqual(by_step["2026-05-01T10:03"], {"dave"})     # from the message
         self.assertEqual(by_step["2026-05-01T10:04"], {"alice"})    # the events table wins
         self.assertEqual(manifest["read"]["actors_from_commit_messages"], 1)
+
+    def test_the_message_never_overrides_an_ambiguous_commit_or_a_second_name(self):
+        # Step 3: two actors in bd's events table (none is right) and a message naming one.
+        # Step 4: no events row, and a message with two auto-commit names (none is clear).
+        self.extra = {3: "INSERT INTO events VALUES ('e3b', 't-1', 'updated', 'bob', NULL, NULL, "
+                         "NULL, '2026-05-03 10:00:00')"}
+        self.messages = {3: "bd: update (auto-commit) by alice [t-1]",
+                         4: "bd: note (auto-commit) by x (auto-commit) by y [t-1]"}
+        self.no_actor = {4}
+        self.build()
+        events, manifest = self.read(export=self.EXPORT)
+        by_step = {}
+        for e in events:
+            by_step.setdefault(e["created_at"][:16], set()).add(e["actor"])
+        self.assertEqual(by_step["2026-05-01T10:03"], {None})
+        self.assertEqual(by_step["2026-05-01T10:04"], {None})
+        self.assertEqual(manifest["read"]["actors_from_commit_messages"], 0)
 
     def test_two_runs_give_the_same_events(self):
         self.build()
