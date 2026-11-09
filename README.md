@@ -301,7 +301,10 @@ unless `--force`; a closed or deferred issue is not claimable (exit 1);
 `--status in_progress` is not a claim (no compare-and-swap, the assignee
 stays); `ready --claim` skips a ready issue assigned to someone else; `note`
 appends a line to `notes`; `dep rm A B` removes every edge from A to B whatever
-its type; `delete` removes the edges into the issue too. A WHEN for `defer`
+its type; `delete` removes the edges into the issue too. `update --status closed`
+is that same close (since 0.8.1; before, it closed over an open blocker and wrote
+no reason): refused over an open blocker, the default reason written, a closed
+issue left as it is. A WHEN for `defer`
 and `--defer` is an ISO date or timestamp, `+Nh`, `+Nd`, `+Nw` or `tomorrow`,
 checked before anything is written.
 
@@ -404,6 +407,12 @@ Measured on a throwaway bd 1.1.2 store and pinned by `tests/test_semantics.py`:
   the same edges and names the path; pinned in `tests/test_writer.py` and
   `tests/test_drill.py`. `cairn check` reports, as an error, any `blocks` cycle
   a store already holds (one written before cairn refused them, or imported).
+  Since 0.8.1 cairn does NOT follow bd on the `parent-child` case: because a
+  blocked parent blocks its children, an epic that depends on its own child
+  leaves both blocked for good, so `dep add` also refuses an edge that closes a
+  cycle through `blocks` and `parent-child` edges together, or through
+  `parent-child` edges alone, and `check` reports either as an error. `related`
+  and `discovered-from` still never count.
 - `dependency_count` / `dependent_count` count `blocks` edges only in `list`,
   `ready` and `export`, but edges of every type in `show` (so an epic's children
   are dependents there). cairn reproduces both.

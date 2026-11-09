@@ -384,11 +384,82 @@ class DependencyTest(WritableCase):
         code, _, err = self.cli("dep", "add", b, a, "--actor", "x")
         self.assertEqual(code, 1, err)
 
-    def test_only_blocks_edges_make_a_cycle(self):
-        # bd accepts each of these (measured): the walk follows blocks edges only.
+    def test_an_epic_cannot_depend_on_its_own_child(self):
+        # bd 1.1.2 accepts this (measured) and both are then blocked for good: p by its
+        # open blocker k, k through its blocked parent (workspace-lp2r).
         p, k = self.new("p"), self.new("k")
         self.w("dep", "add", k, p, "--type", "parent-child")
-        self.w("dep", "add", p, k)
+        code, _, err = self.cli("dep", "add", p, k, "--actor", "x")
+        self.assertEqual(code, 1)
+        self.assertIn(f"adding dependency would create a cycle: {p} -> {k} -> {p}", err)
+        self.assertIn("a blocked parent blocks its children", err)
+        self.assertEqual({p, k}, set(self.ready()))
+        # at any depth, and from the other side: the child edge that would close it
+        g = self.new("g", "--parent", k)
+        self.assertEqual(self.cli("dep", "add", p, g, "--actor", "x")[0], 1)
+        a, b = self.new("a"), self.new("b")
+        self.w("dep", "add", a, b)
+        code, _, err = self.cli("dep", "add", b, a, "--type", "parent-child", "--actor", "x")
+        self.assertEqual(code, 1)
+        self.assertIn("a blocked parent blocks its children", err)
+        # a child may wait on its parent's sibling, or on its own parent: no cycle
+        s = self.new("s", "--parent", p)
+        self.w("dep", "add", k, s)
+        self.w("dep", "add", g, p)
+        self.assertEqual(self.cli("check", "--json")[0], 0)
+
+    def test_a_parent_child_cycle_is_refused(self):
+        x, y, z = self.new("x"), self.new("y"), self.new("z")      # workspace-zucd
+        self.w("dep", "add", x, y, "--type", "parent-child")
+        self.w("dep", "add", y, z, "--type", "parent-child")
+        code, _, err = self.cli("dep", "add", z, x, "--type", "parent-child", "--actor", "x")
+        self.assertEqual(code, 1)
+        self.assertIn(f"would create a cycle: {z} -> {x} -> {y} -> {z} (parent-child edges)", err)
+        self.assertEqual(len(self.snap().deps), 2)
+
+    def test_check_names_a_cycle_through_parent_edges_already_in_the_store(self):
+        # Stores written before 0.8.1, or imported from bd, can hold them.
+        p, k, x, y = self.new("p"), self.new("k"), self.new("x"), self.new("y")
+        self.w("dep", "add", k, p, "--type", "parent-child")
+        self.w("dep", "add", x, y, "--type", "parent-child")
+        conn = sqlite3.connect(db_path(self.store_dir))
+        self.addCleanup(conn.close)
+        with conn:
+            conn.executemany(
+                "INSERT INTO dependencies(issue_id, depends_on_id, type, created_at, created_by) "
+                "VALUES (?, ?, ?, '2026-10-19T00:00:00Z', 'old')",
+                [(p, k, "blocks"), (y, x, "parent-child")])
+        code, out, _ = self.cli("check", "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(sorted(e for e in json.loads(out)["errors"] if "cycle" in e), sorted([
+            f"blocks and parent-child cycle: {', '.join(sorted([p, k]))} (a blocked parent "
+            "blocks its children: none of them can become ready)",
+            f"parent-child cycle: {', '.join(sorted([x, y]))}"]))
+
+    def test_update_status_closed_is_the_same_close(self):
+        b, d = self.new("b"), self.new("d")                        # workspace-2abx
+        self.w("dep", "add", d, b)
+        code, _, err = self.cli("update", d, "--status", "closed", "--actor", "x")
+        self.assertEqual(code, 1)
+        self.assertIn(f"cannot close {d}: blocked by open issues [{b}]", err)
+        self.assertIn(f"cairn close {d} --force", err)
+        self.assertEqual(self.row(d)["status"], "open")
+        self.w("update", b, "--status", "closed")
+        row = self.row(b)
+        self.assertEqual((row["status"], row["close_reason"]), ("closed", "Closed"))
+        self.assertTrue(row["closed_at"])
+        status = [d for d in (json.loads(e["data"]) for e in self.events(b))
+                  if d.get("field") == "status"]
+        self.assertEqual(status[-1]["reason"], "Closed")
+        # a closed issue is left as it is, as `close` leaves it
+        before, events = dict(self.row(b)), len(self.events(b))
+        self.w("update", b, "--status", "closed")
+        self.assertEqual(dict(self.row(b)), before)
+        self.assertEqual(len(self.events(b)), events)
+        self.w("update", d, "--status", "closed")                 # the blocker is closed now
+
+    def test_related_and_discovered_from_never_make_a_cycle(self):
+        # bd accepts each of these (measured): only edges an issue waits along count.
         x, y = self.new("x"), self.new("y")
         self.w("dep", "add", x, y)
         self.w("dep", "add", y, x, "--type", "related")

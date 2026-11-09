@@ -18,7 +18,14 @@ with these deliberate differences:
   - `delete` without --force is refused (exit 2); bd prints a preview, exit 0;
   - `delete` does not rewrite mentions of the id in other issues' text; bd does;
   - `remember` requires a key (the session hooks' admission rule);
-  - closing a closed issue is a no-op, as in bd, but without bd's exit 0 text.
+  - closing a closed issue is a no-op, as in bd, but without bd's exit 0 text;
+  - `dep add` refuses a cycle through `blocks` and `parent-child` edges taken
+    together (an epic that depends on its own child; a parent-child loop). bd
+    1.1.2 walks blocks edges only and accepts both (measured), which leaves
+    every member blocked for good: a blocked parent blocks its children;
+  - `update --status closed` closes as `close` does: refused over an open
+    blocker (the override is `close --force`), the default reason written, a
+    closed issue left as it is (bd not measured).
 Measured and matched: a deferred or closed issue is not claimable; `close`
 refuses an issue with an open blocker unless forced; `--defer`/`--until` take
 an ISO date or timestamp, `+Nd`, `+Nw`, `+Nh` or `tomorrow`.
@@ -49,6 +56,8 @@ ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 MIN_WIDTH = 3
 TRIES_PER_WIDTH = 64
 DEP_TYPES = (BLOCKING_TYPE, PARENT_TYPE, "related", "discovered-from")
+# The edges an issue waits along: on its blockers, and on its parent's (queries.blocked).
+CYCLE_TYPES = (BLOCKING_TYPE, PARENT_TYPE)
 FIELD_COLUMNS = ("title", "description", "design", "acceptance_criteria", "notes",
                  "priority", "issue_type", "assignee", "status", "defer_until")
 DEFAULT_CLOSE_REASON = "Closed"
@@ -295,6 +304,7 @@ class Writer:
                 self._claim(now, row)
                 row = self._issue(issue_id)
             changes: Dict[str, Any] = {}
+            close_reason: Optional[str] = None
             for col, value in (("title", title), ("description", description),
                                ("design", design), ("acceptance_criteria", acceptance),
                                ("priority", priority), ("issue_type", issue_type)):
@@ -307,14 +317,20 @@ class Writer:
             if append_notes is not None:
                 base = changes.get("notes", row["notes"])
                 changes["notes"] = f"{base}\n{append_notes}" if base else append_notes
-            if status is not None:
+            if status == "closed":
+                # The same close as `close`, not a way round its refusal.
+                if row["status"] != "closed":
+                    self._refuse_open_blockers(issue_id)
+                    changes.update(self._status_changes(now, row, status))
+                    changes["close_reason"] = close_reason = DEFAULT_CLOSE_REASON
+            elif status is not None:
                 changes.update(self._status_changes(now, row, status))
             if defer_until:
                 if status not in (None, "deferred"):
                     raise WriteRefused("--defer and --status together: pick one")
                 changes.update(self._status_changes(now, row, "deferred"))
                 changes["defer_until"] = defer_until
-            self._set(now, row, changes)
+            self._set(now, row, changes, reason=close_reason)
             for label in dict.fromkeys(add_labels):
                 if self.conn.execute("INSERT OR IGNORE INTO labels(issue_id, label) VALUES (?, ?)",
                                      (issue_id, label)).rowcount:
@@ -403,18 +419,23 @@ class Writer:
             if row["status"] == "closed":
                 return False
             if not force:
-                open_blockers = [r[0] for r in self.conn.execute(
-                    "SELECT d.depends_on_id FROM dependencies d JOIN issues i "
-                    "ON i.id = d.depends_on_id WHERE d.issue_id = ? AND d.type = 'blocks' "
-                    "AND i.status != 'closed' ORDER BY d.depends_on_id", (issue_id,))]
-                if open_blockers:
-                    raise WriteConflict(
-                        f"cannot close {issue_id}: blocked by open issues "
-                        f"[{', '.join(open_blockers)}] (use --force to override)")
+                self._refuse_open_blockers(issue_id, override="--force")
             changes = self._status_changes(now, row, "closed")
             changes["close_reason"] = reason or DEFAULT_CLOSE_REASON
             self._set(now, row, changes, reason=changes["close_reason"])
         return True
+
+    def _refuse_open_blockers(self, issue_id: str, *, override: Optional[str] = None) -> None:
+        """An open `blocks` dependency refuses a close, whichever verb asks for it."""
+        open_blockers = [r[0] for r in self.conn.execute(
+            "SELECT d.depends_on_id FROM dependencies d JOIN issues i "
+            "ON i.id = d.depends_on_id WHERE d.issue_id = ? AND d.type = 'blocks' "
+            "AND i.status != 'closed' ORDER BY d.depends_on_id", (issue_id,))]
+        if open_blockers:
+            raise WriteConflict(
+                f"cannot close {issue_id}: blocked by open issues "
+                f"[{', '.join(open_blockers)}] "
+                f"(use {override or f'`cairn close {issue_id} --force`'} to override)")
 
     def reopen(self, issue_id: str) -> None:
         with self.transaction() as now:
@@ -512,20 +533,30 @@ class Writer:
                 if other is not None:
                     raise WriteRefused(f"{issue_id} already has a parent ({other[0]}); "
                                        "an issue has one parent")
-            if dep_type == BLOCKING_TYPE:
-                path = self._blocks_path(depends_on, issue_id)
+            if dep_type in CYCLE_TYPES:
+                path = (self._path(depends_on, issue_id, (BLOCKING_TYPE,))
+                        if dep_type == BLOCKING_TYPE else None)
+                why = ""
+                if path is None:
+                    path = self._path(depends_on, issue_id, CYCLE_TYPES)
+                    why = (" (through parent-child edges: a blocked parent blocks its "
+                           "children, so no issue on it could become ready)"
+                           if path is not None and (dep_type == BLOCKING_TYPE or self._path(
+                               depends_on, issue_id, (PARENT_TYPE,)) is None)
+                           else " (parent-child edges)")
                 if path is not None:
                     raise WriteConflict("adding dependency would create a cycle: "
-                                        + " -> ".join([issue_id] + path))
+                                        + " -> ".join([issue_id] + path) + why)
             self._insert_dep(now, issue_id, depends_on, dep_type)
             self.conn.execute("UPDATE issues SET updated_at = ? WHERE id = ?", (now, issue_id))
         return True
 
-    def _blocks_path(self, start: str, goal: str) -> Optional[List[str]]:
-        """The blocks edges from `start` to `goal` (start first, goal last), or
+    def _path(self, start: str, goal: str, types: Sequence[str]) -> Optional[List[str]]:
+        """The edges of `types` from `start` to `goal` (start first, goal last), or
         None. bd walks blocks edges only, whatever the issues' status (measured on
         1.1.2; the refusal itself also on 1.3.0; workspace-7m8.19): a closed issue on
-        the path still counts, a parent-child or related edge does not. Neighbours
+        the path still counts. cairn walks parent-child edges as well (dep_add: a
+        cycle through both is a deadlock too); a related edge never counts. Neighbours
         are read per node through the primary key, so the walk touches only what
         `start` reaches, not the whole graph."""
         came_from: Dict[str, Optional[str]] = {start: None}
@@ -539,8 +570,9 @@ class Writer:
                     node = came_from[node]
                 return path[::-1]
             for (nxt,) in self.conn.execute(
-                    "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = ? "
-                    "ORDER BY depends_on_id", (node, BLOCKING_TYPE)):
+                    "SELECT DISTINCT depends_on_id FROM dependencies WHERE issue_id = ? "
+                    "AND type IN (SELECT value FROM json_each(?)) ORDER BY depends_on_id",
+                    (node, json.dumps(list(types)))):
                 if nxt not in came_from:
                     came_from[nxt] = node
                     queue.append(nxt)

@@ -486,15 +486,17 @@ def recall(conn: sqlite3.Connection, key: str) -> Optional[sqlite3.Row]:
 
 # -- health -----------------------------------------------------------------
 
-def blocks_cycles(conn: sqlite3.Connection) -> List[List[str]]:
+def blocks_cycles(conn: sqlite3.Connection,
+                  types: Sequence[str] = (BLOCKING_TYPE,)) -> List[List[str]]:
     """Each set of issues that block one another in a cycle (a strongly connected
-    component of the blocks edges with more than one member), members sorted,
-    sets sorted. Iterative Tarjan: dependency chains can be deeper than the
-    recursion limit. A self edge is reported by check on its own."""
+    component of the edges of `types`, the blocks edges by default, with more than
+    one member), members sorted, sets sorted. Iterative Tarjan: dependency chains
+    can be deeper than the recursion limit. A self edge is reported by check on
+    its own."""
     edges: Dict[str, List[str]] = {}
-    for src, dst in conn.execute("SELECT issue_id, depends_on_id FROM dependencies "
-                                 "WHERE type = ? ORDER BY issue_id, depends_on_id",
-                                 (BLOCKING_TYPE,)):
+    for src, dst in conn.execute("SELECT DISTINCT issue_id, depends_on_id FROM dependencies "
+                                 "WHERE type IN (SELECT value FROM json_each(?)) "
+                                 "ORDER BY issue_id, depends_on_id", (json.dumps(list(types)),)):
         edges.setdefault(src, []).append(dst)
     index: Dict[str, int] = {}
     low: Dict[str, int] = {}
@@ -566,8 +568,25 @@ def check(conn: sqlite3.Connection) -> Dict[str, List[str]]:
         errors.append(f"{row['issue_id']} has {row['n']} parents (expected at most one)")
     # dep add refuses a blocks cycle (as bd does); a store written before that,
     # or imported, can still hold one, and its members are missing from ready.
-    for members in blocks_cycles(conn):
+    blocks_only = blocks_cycles(conn)
+    for members in blocks_only:
         errors.append(f"blocks cycle: {', '.join(members)} (none of them can become ready)")
+    # dep add refuses these too since 0.8.1. A blocked parent blocks its children, so a
+    # cycle that runs through a parent-child edge and a blocks edge is the same deadlock
+    # (an epic that depends on its own child); one of parent-child edges alone is a
+    # hierarchy with no top.
+    for members in blocks_cycles(conn, (BLOCKING_TYPE, PARENT_TYPE)):
+        if members in blocks_only:
+            continue
+        inside = json.dumps(members)
+        waits = conn.execute(
+            "SELECT 1 FROM dependencies WHERE type = ? "
+            "AND issue_id IN (SELECT value FROM json_each(?)) "
+            "AND depends_on_id IN (SELECT value FROM json_each(?)) LIMIT 1",
+            (BLOCKING_TYPE, inside, inside)).fetchone()
+        errors.append(f"blocks and parent-child cycle: {', '.join(members)} (a blocked parent "
+                      "blocks its children: none of them can become ready)" if waits else
+                      f"parent-child cycle: {', '.join(members)}")
 
     if "schema_version" in keys:
         warnings.append("memory key 'schema_version' collides with the key bd's JSON "
