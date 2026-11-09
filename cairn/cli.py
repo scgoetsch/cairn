@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import PROG, __version__, doltseed, memgraph, prime, shadow, sync as syncmod, timeutil
+from . import search as searchmod, stale as stalemod
 from .importer import ENV_PREFIXES, SourceError, build_store, build_writable, read_jsonl
 from .queries import (LINKED_OMITS, Snapshot, check, events_lines, export_lines,
                       history_events, memories, recall, stats)
@@ -530,7 +531,12 @@ def cmd_export(args, start: Path) -> int:
 
 def cmd_check(args, start: Path) -> int:
     conn = connect(start)
-    result = check(conn)
+    result: Dict[str, Any] = dict(check(conn))
+    stale = None
+    if args.stale:
+        # The checkout the store belongs to: through a worktree's redirect, the main one.
+        stale = stalemod.stale_memories(conn, store_dir_or_fail(start).resolve().parent)
+        result["stale"] = stale["stale"]
     if args.json:
         emit_json(result)
         return 1 if result["errors"] else 0
@@ -540,12 +546,45 @@ def cmd_check(args, start: Path) -> int:
         print(f"⚠ {message}")
     for message in result["notes"]:
         print(f"ℹ {message}")
+    if stale is not None:
+        for finding in stale["stale"]:
+            print(f"⌛ {finding['message']}")
+        if not stale["paths_checked"]:
+            print("ℹ paths not checked: git could not list this checkout's deleted files")
+        if stale["unchecked"]:
+            print(f"ℹ {stale['unchecked']} memories have no recorded write time and were not checked")
     counts = stats(conn)
     verdict = "✗ FAIL" if result["errors"] else "✓ OK"
     print(f"{verdict} — {counts['issues']} issues, {counts['dependencies']} dependencies, "
           f"{counts['memories']} memories, {counts['memory_edges']} memory links, "
-          f"{len(result['errors'])} errors, {len(result['warnings'])} warnings")
+          f"{len(result['errors'])} errors, {len(result['warnings'])} warnings"
+          + (f", {len(stale['stale'])} stale anchors" if stale is not None else ""))
     return 1 if result["errors"] else 0
+
+
+def cmd_search(args, start: Path) -> int:
+    conn = connect(start)
+    kinds = ("issue",) if args.issues else ("memory",) if args.memories else searchmod.KINDS
+    text = " ".join(args.query)
+    try:
+        rows = searchmod.search(conn, text, kinds=kinds, include_closed=not args.open,
+                                limit=args.limit)
+    except searchmod.SearchUnavailable as exc:
+        raise Refused(str(exc)) from None
+    if args.json:
+        emit_json(rows)
+        return 0
+    if not searchmod.query_terms(text):
+        raise Refused("nothing to search for: every word of the query is too common to rank by")
+    for r in rows:
+        if r["kind"] == "issue":
+            print(f"  {r['id']}  [{r['status']}]  {r['title']}")
+        else:
+            print(f"  memory {r['id']}")
+        print(f"      {r['snippet']}")
+    if not rows:
+        print("  (no matches)")
+    return 0
 
 
 def cmd_import(args, start: Path) -> int:
@@ -1162,8 +1201,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "`init --from ... --events`, instead of rows")
     p.set_defaults(func=cmd_export)
 
-    sub.add_parser("check", help="referential integrity of issues and memory links"
-                   ).set_defaults(func=cmd_check)
+    p = sub.add_parser("check", help="referential integrity of issues and memory links")
+    p.add_argument("--stale", action="store_true",
+                   help="also list memories naming an issue closed, or a path git deleted, "
+                        "after the memory last changed (does not change the exit code)")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("search", help="ranked full-text search over issues and memories "
+                                      "(BM25; any word may match)")
+    p.add_argument("query", nargs="+")
+    which = p.add_mutually_exclusive_group()
+    which.add_argument("--issues", action="store_true", help="issues only")
+    which.add_argument("--memories", action="store_true", help="memories only")
+    p.add_argument("--open", action="store_true", help="leave closed issues out")
+    p.add_argument("-n", "--limit", type=non_negative, default=10, help="at most N (0: all)")
+    p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("import", help="build the store from a bd JSONL export")
     p.add_argument("file")

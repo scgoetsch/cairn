@@ -37,7 +37,8 @@ cairn shadow status      # progress against the exit criteria
 
 cairn ready [--json] [-n N] [-p P1] [-t bug] [--parent ID] [--include-deferred]
 cairn list  [--status=in_progress] [--all] [--json] [-n N]
-cairn blocked | show ID... | stats | where | check
+cairn blocked | show ID... | stats | where | check [--stale]
+cairn search WORDS... [--issues | --memories] [--open] [-n N] [--json]   # ranked, BM25
 cairn memories [keyword] | recall KEY
 cairn memories --rank [keyword] [-n N] [--half-life D] [--recency-weight W] [--json]
 cairn related KEY [--depth N] [--json]                      # a memory's links, out and in
@@ -537,6 +538,32 @@ as `null`, lists and objects as one sorted JSON line, and the lines of a multi-l
 under its key. An unknown issue or key exits 1; one that exists with no events (an issue imported
 from bd without history) prints `No events for ID` and exits 0. A read verb: it answers on a shadow
 and on a store that is behind or diverged, after the warning.
+
+## Search, and memories gone stale
+
+`cairn search WORDS...` ranks issues (title, then description, design and
+acceptance criteria, then notes) and memories (key, then body) by BM25, using
+SQLite's FTS5 over an index built in memory for each call; any word may match,
+closed issues included unless `--open`. It is for finding the earlier work a
+new issue relates to and the memories a task needs, where bd had no ranked
+search. Measured with `dev/search-eval.py` on the workspace store (126 issues
+whose dependencies point at earlier issues; 30 issues that name memories): the
+top 10 held 79% of the linked earlier issues (65% with notes left out, the
+floor, since notes can be written after the newer issue) against 62% for
+newest-first, and 75% of the named memories against 19% for the hot tier and
+72% for substring matching. An embedding model (nomic-embed-text) did no better,
+and worse on issues, so there is none. A Python whose SQLite lacks FTS5 is
+refused with exit 2.
+
+`cairn check --stale` also lists memories whose anchors changed after they were
+last written: an issue the body names that was closed later, or a repo-relative
+path it names that git deleted later (`git log --all --diff-filter=D`; a path
+never in this repo is not reported). A change within two hours of the write is
+taken as the same piece of work. The findings are prompts for review, not
+errors, and leave the exit code alone; `check` without the flag is unchanged,
+since the pre-commit hook runs it. On the workspace store it reported 5
+memories naming closed issues: 3 described as pending work that had since been
+done, 1 arguably stale, 1 a provenance reference that stays true.
 
 ## Known limits
 
